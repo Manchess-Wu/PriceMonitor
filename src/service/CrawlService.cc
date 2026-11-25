@@ -11,7 +11,8 @@ namespace pm {
 
 nlohmann::json CrawlService::addProduct(const std::string& url, bool hasTarget,
                                         double targetPrice, const std::string& note,
-                                        std::string& error, int& code) {
+                                        int intervalMinutes, std::string& error,
+                                        int& code) {
     if (hasTarget && !(targetPrice > 0)) {
         error = "目标价必须大于 0";
         code = 400;
@@ -42,6 +43,7 @@ nlohmann::json CrawlService::addProduct(const std::string& url, bool hasTarget,
     product.enabled = true;
     product.createdAt = nowSeconds();
     product.updatedAt = product.createdAt;
+    product.intervalMinutes = intervalMinutes > 0 ? intervalMinutes : 0;
 
     FetchResult fetchResult;
     if (auto adapter = createAdapter(product.platform, config_)) {
@@ -53,6 +55,8 @@ nlohmann::json CrawlService::addProduct(const std::string& url, bool hasTarget,
     const int64_t checkedAt = nowSeconds();
     product.hasLastChecked = true;
     product.lastCheckedAt = checkedAt;
+    // 首次采集算作一次自动采集，下一次到期时间 = 加入时间 + 间隔
+    product.lastAutoCheckedAt = checkedAt;
 
     if (fetchResult.ok) {
         product.title = fetchResult.title;
@@ -130,6 +134,7 @@ nlohmann::json CrawlService::updateProduct(long long id, const nlohmann::json& p
     double targetPrice = product->targetPrice;
     std::string note = product->note;
     bool enabled = product->enabled;
+    int intervalMinutes = product->intervalMinutes;
 
     if (patch.contains("targetPrice")) {
         const auto& value = patch.at("targetPrice");
@@ -167,8 +172,27 @@ nlohmann::json CrawlService::updateProduct(long long id, const nlohmann::json& p
         }
         enabled = patch.at("enabled").get<bool>();
     }
+    if (patch.contains("intervalMinutes")) {
+        const auto& value = patch.at("intervalMinutes");
+        if (value.is_null()) {
+            intervalMinutes = 0;  // 0 = 使用全局默认间隔
+        } else if (value.is_number_integer()) {
+            const long long parsed = value.get<long long>();
+            if (parsed < 0 || parsed > 10080) {
+                error = "检索间隔必须是 0-10080 之间的整数（分钟）";
+                code = 400;
+                return nlohmann::json();
+            }
+            intervalMinutes = static_cast<int>(parsed);
+        } else {
+            error = "intervalMinutes 必须是整数或 null";
+            code = 400;
+            return nlohmann::json();
+        }
+    }
 
-    if (!db_.updateProductSettings(id, hasTarget, targetPrice, note, enabled)) {
+    if (!db_.updateProductSettings(id, hasTarget, targetPrice, note, enabled,
+                                   intervalMinutes)) {
         error = db_.lastError();
         code = 500;
         return nlohmann::json();
@@ -197,8 +221,16 @@ nlohmann::json CrawlService::deleteProduct(long long id, std::string& error,
 
 nlohmann::json CrawlService::refreshProduct(long long id, std::string& error,
                                             int& code) {
+    // 手动检索：已有采集在跑时直接拒绝，不排队、不打断正在进行的采集
+    std::unique_lock<std::mutex> lock(crawlMutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        error = "正在检索价格，请等待本次采集完成后再试";
+        code = 409;
+        return nlohmann::json();
+    }
+
     std::string crawlError;
-    if (!crawl(id, crawlError)) {
+    if (!crawlInternal(id, crawlError, false)) {
         error = crawlError;
         code = 502;
         return nlohmann::json();
@@ -206,7 +238,12 @@ nlohmann::json CrawlService::refreshProduct(long long id, std::string& error,
     return getProduct(id, error, code);
 }
 
-bool CrawlService::crawl(long long id, std::string& error) {
+bool CrawlService::crawl(long long id, std::string& error, bool autoCrawl) {
+    std::lock_guard<std::mutex> lock(crawlMutex_);
+    return crawlInternal(id, error, autoCrawl);
+}
+
+bool CrawlService::crawlInternal(long long id, std::string& error, bool autoCrawl) {
     auto product = db_.getProduct(id);
     if (!product) {
         error = "商品不存在";
@@ -226,7 +263,7 @@ bool CrawlService::crawl(long long id, std::string& error) {
     const int64_t checkedAt = nowSeconds();
 
     if (!fetchResult.ok) {
-        db_.updateCheckStatus(id, checkedAt, fetchResult.error);
+        db_.updateCheckStatus(id, checkedAt, fetchResult.error, autoCrawl);
         db_.addCrawlLog(id, false, fetchResult.error);
         error = fetchResult.error;
         return false;
@@ -249,11 +286,11 @@ bool CrawlService::crawl(long long id, std::string& error) {
 
     if (!db_.addPriceRecord(record)) {
         error = db_.lastError();
-        db_.updateCheckStatus(id, checkedAt, error);
+        db_.updateCheckStatus(id, checkedAt, error, autoCrawl);
         return false;
     }
 
-    db_.updateCheckStatus(id, checkedAt, "");
+    db_.updateCheckStatus(id, checkedAt, "", autoCrawl);
     db_.addCrawlLog(id, true, "");
     notifier_.evaluate(*product, record, previous, db_);
     return true;

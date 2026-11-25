@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS products (
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL,
     last_checked_at    INTEGER,
+    last_auto_checked_at INTEGER,
+    interval_minutes   INTEGER NOT NULL DEFAULT 0,
     last_error         TEXT    NOT NULL DEFAULT '',
     last_notified_price REAL,
     UNIQUE(platform, product_id)
@@ -68,7 +70,8 @@ SELECT p.id, p.platform, p.product_id, p.url, p.title, p.shop_name, p.image_url,
        (SELECT r.in_stock FROM price_records r WHERE r.product_id = p.id
             ORDER BY r.captured_at DESC, r.id DESC LIMIT 1),
        (SELECT r.captured_at FROM price_records r WHERE r.product_id = p.id
-            ORDER BY r.captured_at DESC, r.id DESC LIMIT 1)
+            ORDER BY r.captured_at DESC, r.id DESC LIMIT 1),
+       p.interval_minutes, p.last_auto_checked_at
 FROM products p
 )SQL";
 
@@ -155,6 +158,8 @@ Product mapProduct(sqlite3_stmt* st) {
         p.hasLastCapture = true;
         p.lastCaptureAt = sqlite3_column_int64(st, 17);
     }
+    p.intervalMinutes = sqlite3_column_int(st, 18);
+    if (!colIsNull(st, 19)) p.lastAutoCheckedAt = sqlite3_column_int64(st, 19);
     return p;
 }
 
@@ -250,6 +255,42 @@ bool Database::initSchema() {
         if (errMsg) sqlite3_free(errMsg);
         return false;
     }
+
+    // 旧库升级：补齐后加的列。last_auto_checked_at 用 last_checked_at 回填，
+    // 避免升级后所有商品立刻被判为到期而集中采集。
+    auto hasColumn = [this](const std::string& name) {
+        Stmt st(db_, "PRAGMA table_info(products)");
+        if (!st.valid()) return false;
+        while (st.step() == SQLITE_ROW) {
+            if (colText(st.raw(), 1) == name) return true;
+        }
+        return false;
+    };
+    auto execSql = [this](const char* sql) {
+        char* err = nullptr;
+        if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+            setError(std::string("升级数据表失败: ") + (err ? err : ""));
+            if (err) sqlite3_free(err);
+            return false;
+        }
+        return true;
+    };
+
+    if (!hasColumn("last_auto_checked_at")) {
+        if (!execSql("ALTER TABLE products ADD COLUMN last_auto_checked_at INTEGER")) {
+            return false;
+        }
+        if (!execSql("UPDATE products SET last_auto_checked_at = last_checked_at"
+                     " WHERE last_checked_at IS NOT NULL")) {
+            return false;
+        }
+    }
+    if (!hasColumn("interval_minutes")) {
+        if (!execSql("ALTER TABLE products ADD COLUMN interval_minutes INTEGER NOT NULL"
+                     " DEFAULT 0")) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -259,8 +300,8 @@ bool Database::insertProduct(Product& product) {
     const char* sql =
         "INSERT INTO products(platform, product_id, url, title, shop_name, image_url,"
         " target_price, note, enabled, created_at, updated_at, last_checked_at,"
-        " last_error)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)";
+        " last_auto_checked_at, interval_minutes, last_error)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
     Stmt st(db_, sql);
     if (!st.valid()) {
         setError(std::string("插入商品失败: ") + sqlite3_errmsg(db_));
@@ -286,6 +327,11 @@ bool Database::insertProduct(Product& product) {
         st.bindInt64(i++, product.lastCheckedAt);
     else
         st.bindNull(i++);
+    if (product.lastAutoCheckedAt > 0)
+        st.bindInt64(i++, product.lastAutoCheckedAt);
+    else
+        st.bindNull(i++);
+    st.bindInt(i++, product.intervalMinutes);
     st.bindText(i++, product.lastError);
 
     if (st.step() != SQLITE_DONE) {
@@ -344,20 +390,25 @@ std::vector<Product> Database::listProducts() {
     return products;
 }
 
-std::vector<long long> Database::listDueProducts(long long cutoff) {
+std::vector<long long> Database::listDueProducts(long long now,
+                                                int defaultIntervalMinutes) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     std::vector<long long> ids;
+    // 到期判断只看 last_auto_checked_at（自动采集锚点），手动检索不会推迟自动计划。
     const char* sql =
         "SELECT id FROM products WHERE enabled = 1"
-        " AND (last_checked_at IS NULL OR last_checked_at <= ?)"
-        " ORDER BY COALESCE(last_checked_at, 0) ASC LIMIT 200";
+        " AND (COALESCE(last_auto_checked_at, 0) = 0"
+        "      OR last_auto_checked_at +"
+        "         (CASE WHEN interval_minutes > 0 THEN interval_minutes ELSE ? END) * 60 <= ?)"
+        " ORDER BY COALESCE(last_auto_checked_at, 0) ASC LIMIT 200";
     Stmt st(db_, sql);
     if (!st.valid()) {
         setError(std::string("查询待采集商品失败: ") + sqlite3_errmsg(db_));
         return ids;
     }
-    st.bindInt64(1, cutoff);
+    st.bindInt(1, defaultIntervalMinutes > 0 ? defaultIntervalMinutes : 60);
+    st.bindInt64(2, now);
     while (st.step() == SQLITE_ROW) {
         ids.push_back(sqlite3_column_int64(st.raw(), 0));
     }
@@ -366,11 +417,13 @@ std::vector<long long> Database::listDueProducts(long long cutoff) {
 
 bool Database::updateProductSettings(long long id, bool hasTarget,
                                      double targetPrice,
-                                     const std::string& note, bool enabled) {
+                                     const std::string& note, bool enabled,
+                                     int intervalMinutes) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     const char* sql =
-        "UPDATE products SET target_price = ?, note = ?, enabled = ?, updated_at = ?"
+        "UPDATE products SET target_price = ?, note = ?, enabled = ?,"
+        " interval_minutes = ?, updated_at = ?"
         " WHERE id = ?";
     Stmt st(db_, sql);
     if (!st.valid()) {
@@ -383,8 +436,9 @@ bool Database::updateProductSettings(long long id, bool hasTarget,
         st.bindNull(1);
     st.bindText(2, note);
     st.bindInt(3, enabled ? 1 : 0);
-    st.bindInt64(4, nowSeconds());
-    st.bindInt64(5, id);
+    st.bindInt(4, intervalMinutes > 0 ? intervalMinutes : 0);
+    st.bindInt64(5, nowSeconds());
+    st.bindInt64(6, id);
 
     if (st.step() != SQLITE_DONE) {
         setError(std::string("更新商品失败: ") + sqlite3_errmsg(db_));
@@ -426,21 +480,25 @@ bool Database::updateProductMeta(long long id, const std::string& title,
 }
 
 bool Database::updateCheckStatus(long long id, long long checkedAt,
-                                 const std::string& error) {
+                                 const std::string& error, bool autoCrawl) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    const char* sql =
-        "UPDATE products SET last_checked_at = ?, last_error = ?, updated_at = ?"
-        " WHERE id = ?";
+    const char* sql = autoCrawl
+        ? "UPDATE products SET last_checked_at = ?, last_error = ?, updated_at = ?,"
+          " last_auto_checked_at = ? WHERE id = ?"
+        : "UPDATE products SET last_checked_at = ?, last_error = ?, updated_at = ?"
+          " WHERE id = ?";
     Stmt st(db_, sql);
     if (!st.valid()) {
         setError(std::string("更新采集状态失败: ") + sqlite3_errmsg(db_));
         return false;
     }
-    st.bindInt64(1, checkedAt);
-    st.bindText(2, error);
-    st.bindInt64(3, checkedAt);
-    st.bindInt64(4, id);
+    int i = 1;
+    st.bindInt64(i++, checkedAt);
+    st.bindText(i++, error);
+    st.bindInt64(i++, checkedAt);
+    if (autoCrawl) st.bindInt64(i++, checkedAt);
+    st.bindInt64(i++, id);
 
     if (st.step() != SQLITE_DONE) {
         setError(std::string("更新采集状态失败: ") + sqlite3_errmsg(db_));

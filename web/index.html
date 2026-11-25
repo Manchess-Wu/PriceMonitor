@@ -329,6 +329,11 @@
         <input type="number" name="targetPrice" id="targetInput" step="0.01" min="0" placeholder="例如 1999">
       </div>
       <div class="field">
+        <label>检索间隔（分钟，留空使用默认 60）</label>
+        <input type="number" name="intervalMinutes" id="intervalInput" step="1" min="1" max="10080" placeholder="留空则使用默认间隔">
+        <div class="hint">只影响自动采集；手动点“采集”不会改变下次自动采集时间</div>
+      </div>
+      <div class="field">
         <label>备注（可选）</label>
         <input type="text" name="note" id="noteInput" maxlength="200" placeholder="例如：送给爸妈的，降到 1500 以下再买">
       </div>
@@ -425,7 +430,9 @@
     try { payload = await resp.json(); } catch (e) { payload = null; }
     if (!resp.ok || !payload || payload.ok !== true) {
       const message = payload && payload.error ? payload.error : ("HTTP " + resp.status);
-      throw new Error(message);
+      const err = new Error(message);
+      err.status = resp.status;
+      throw err;
     }
     return payload.data;
   }
@@ -463,6 +470,13 @@
     const targetText = product.targetPrice == null
       ? "未设置目标价"
       : "目标价 ¥" + fmtPrice(product.targetPrice);
+    const defaultInterval = state.stats && state.stats.intervalMinutes
+      ? state.stats.intervalMinutes : 60;
+    const intervalText = product.intervalMinutes > 0
+      ? "每 " + product.intervalMinutes + " 分钟"
+      : "默认（每 " + defaultInterval + " 分钟）";
+    const intervalMinutes = product.intervalMinutes > 0 ? product.intervalMinutes : defaultInterval;
+    const nextAutoAt = product.lastAutoCheckedAt ? product.lastAutoCheckedAt + intervalMinutes * 60 : null;
     const image = '<div class="ph">' + esc(label) + "</div>" +
       (product.imageUrl
         ? '<img loading="lazy" src="' + esc(product.imageUrl) +
@@ -486,6 +500,8 @@
           "</div>" +
           '<div class="meta">' +
             "<span>" + targetText + "</span>" +
+            "<span>检索间隔：" + esc(intervalText) + "</span>" +
+            (nextAutoAt ? "<span>下次自动：" + esc(fmtDateTime(nextAutoAt)) + "</span>" : "") +
             "<span>最后采集：" + esc(relTime(product.lastCheckedAt)) +
               (product.lastCheckedAt ? "（" + fmtDateTime(product.lastCheckedAt) + "）" : "") + "</span>" +
             (product.note ? "<span>备注：" + esc(product.note) + "</span>" : "") +
@@ -547,7 +563,7 @@
     state.editing = product || null;
     $("modalTitle").textContent = product ? "编辑监控商品" : "添加监控商品";
     $("modalSub").textContent = product
-      ? "修改目标价、备注或启用状态"
+      ? "修改目标价、检索间隔、备注或启用状态"
       : "支持 item.jd.com、item.taobao.com、detail.tmall.com 及短链接";
     $("urlInput").value = product ? product.url : "";
     $("urlInput").disabled = !!product;
@@ -555,6 +571,7 @@
       ? "商品链接不可修改，如需更换请删除后重新添加"
       : "粘贴商品详情页链接即可，支持京东 / 淘宝 / 天猫短链";
     $("targetInput").value = product && product.targetPrice != null ? product.targetPrice : "";
+    $("intervalInput").value = product && product.intervalMinutes > 0 ? product.intervalMinutes : "";
     $("noteInput").value = product ? (product.note || "") : "";
     $("enabledRow").hidden = !product;
     $("enabledInput").checked = product ? !!product.enabled : true;
@@ -589,6 +606,18 @@
       payload.targetPrice = null;
     }
     payload.note = $("noteInput").value.trim();
+
+    const intervalRaw = $("intervalInput").value.trim();
+    if (intervalRaw) {
+      const minutes = Number(intervalRaw);
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 10080) {
+        toast("检索间隔必须是 1-10080 之间的整数分钟", "error");
+        return;
+      }
+      payload.intervalMinutes = minutes;
+    } else {
+      payload.intervalMinutes = null;
+    }
 
     button.disabled = true;
     button.textContent = state.editing ? "保存中…" : "正在识别并首次采集…";
@@ -633,7 +662,12 @@
       }
       await loadAll(true);
     } catch (error) {
-      toast(error.message, "error");
+      if (error.status === 409) {
+        // 已有采集在跑：按需求用弹窗提示，不排队、不打断当前采集
+        window.alert(error.message);
+      } else {
+        toast(error.message, "error");
+      }
       button.disabled = false;
       button.textContent = original;
     }

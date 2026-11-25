@@ -29,15 +29,18 @@ public:
     std::optional<Product> findProduct(const std::string& platform,
                                        const std::string& productId);
     std::vector<Product> listProducts();
-    std::vector<long long> listDueProducts(long long cutoff);
+    // now: 当前时间戳；defaultIntervalMinutes: 商品未单独设置间隔时使用的全局间隔
+    std::vector<long long> listDueProducts(long long now, int defaultIntervalMinutes);
 
     bool updateProductSettings(long long id, bool hasTarget, double targetPrice,
-                               const std::string& note, bool enabled);
+                               const std::string& note, bool enabled,
+                               int intervalMinutes);
     bool updateProductMeta(long long id, const std::string& title,
                            const std::string& shopName,
                            const std::string& imageUrl);
+    // autoCrawl 为 true 时同时推进自动采集计划时间（last_auto_checked_at）
     bool updateCheckStatus(long long id, long long checkedAt,
-                           const std::string& error);
+                           const std::string& error, bool autoCrawl);
     bool deleteProduct(long long id);
 
     // price_records

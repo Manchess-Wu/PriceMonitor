@@ -57,7 +57,7 @@ bool AppContext::init(const std::string& configPath, const std::string& baseDir,
     logInfo("PriceMonitor 已初始化，数据库: " + config_.dbPath);
     logInfo("Web 目录: " + documentRoot_);
     logInfo("采集间隔: " + std::to_string(config_.crawler.intervalMinutes) +
-            " 分钟，并发: " + std::to_string(config_.crawler.concurrency));
+            " 分钟（可按商品单独设置），串行采集");
     if (!config_.crawler.browser.enabled && config_.crawler.taobao.cookie.empty()) {
         logWarn("未配置淘宝 Cookie，淘宝/天猫商品将无法采集");
     }
@@ -75,16 +75,18 @@ bool AppContext::init(const std::string& configPath, const std::string& baseDir,
 void AppContext::startScheduler() {
     if (scheduler_ || !db_ || !crawl_) return;
 
-    const int64_t interval = static_cast<int64_t>(config_.crawler.intervalMinutes) * 60;
     const int tickSeconds =
         std::max(5, std::min(60, config_.crawler.intervalMinutes * 60));
 
+    // 并发固定为 1：自动采集按到期顺序逐个执行，避免多个浏览器实例抢占同一 profile。
     scheduler_ = std::make_unique<Scheduler>(
-        tickSeconds, config_.crawler.concurrency,
-        [this, interval]() { return db_->listDueProducts(nowSeconds() - interval); },
+        tickSeconds, 1,
+        [this]() {
+            return db_->listDueProducts(nowSeconds(), config_.crawler.intervalMinutes);
+        },
         [this](long long id) {
             std::string error;
-            bool ok = crawl_->crawl(id, error);
+            bool ok = crawl_->crawl(id, error, true);
             if (!ok) {
                 logWarn("定时采集失败 (id=" + std::to_string(id) + "): " + error);
             }

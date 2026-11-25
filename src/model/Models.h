@@ -29,6 +29,10 @@ struct Product {
 
     bool hasLastChecked = false;
     long long lastCheckedAt = 0;
+    // 自动采集的调度锚点，手动检索不修改它；0 表示按计划还未采集过。
+    long long lastAutoCheckedAt = 0;
+    // 单商品采集间隔（分钟），0 表示使用全局默认间隔。
+    int intervalMinutes = 0;
     std::string lastError;
 
     bool hasLastPrice = false;
@@ -84,6 +88,9 @@ inline nlohmann::json productToJson(const Product& p) {
     j["lastCheckedAt"] =
         p.hasLastChecked ? nlohmann::json(p.lastCheckedAt) : nlohmann::json(nullptr);
     j["lastCheckedText"] = p.hasLastChecked ? formatTime(p.lastCheckedAt) : "";
+    j["lastAutoCheckedAt"] =
+        p.lastAutoCheckedAt > 0 ? nlohmann::json(p.lastAutoCheckedAt) : nlohmann::json(nullptr);
+    j["intervalMinutes"] = p.intervalMinutes;
     j["lastError"] = p.lastError;
 
     j["lastPrice"] = p.hasLastPrice ? nlohmann::json(p.lastPrice) : nlohmann::json(nullptr);

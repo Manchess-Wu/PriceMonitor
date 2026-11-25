@@ -117,10 +117,24 @@ void ApiController::addProduct(const HttpRequestPtr& req, std::function<void(con
         targetPrice = body.at("targetPrice").get<double>();
     }
 
+    int intervalMinutes = 0;
+    if (body.contains("intervalMinutes") && !body.at("intervalMinutes").is_null()) {
+        if (!body.at("intervalMinutes").is_number_integer()) {
+            callback(errorResponse(400, "intervalMinutes 必须是整数或 null"));
+            return;
+        }
+        const long long parsed = body.at("intervalMinutes").get<long long>();
+        if (parsed < 0 || parsed > 10080) {
+            callback(errorResponse(400, "检索间隔必须是 0-10080 之间的整数（分钟）"));
+            return;
+        }
+        intervalMinutes = static_cast<int>(parsed);
+    }
+
     std::string error;
     int code = 200;
-    auto product = AppContext::instance().crawl().addProduct(url, hasTarget, targetPrice,
-                                                             note, error, code);
+    auto product = AppContext::instance().crawl().addProduct(
+        url, hasTarget, targetPrice, note, intervalMinutes, error, code);
     if (!error.empty()) {
         callback(errorResponse(code, error));
         return;

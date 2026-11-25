@@ -1,0 +1,39 @@
+{
+  "server": {
+    "listen": "0.0.0.0",
+    "port": 8080,
+    "threads": 4,
+    "document_root": "./web"
+  },
+  "database": {
+    "path": "./data/pricemonitor.db"
+  },
+  "crawler": {
+    "interval_minutes": 60,
+    "timeout_seconds": 20,
+    "concurrency": 2,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "jd": {
+      "cookie": ""
+    },
+    "taobao": {
+      "cookie": "",
+      "user_agent": ""
+    },
+    "browser": {
+      "enabled": true,
+      "headless": true,
+      "chrome_path": "google-chrome",
+      "profile_dir": "./data/chrome-profile",
+      "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      "timeout_seconds": 45
+    }
+  },
+  "notifier": {
+    "enabled": false,
+    "type": "serverchan",
+    "send_key": "",
+    "wecom_webhook": "",
+    "drop_percent": 5.0
+  }
+}

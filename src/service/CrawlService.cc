@@ -1,0 +1,317 @@
+#include "service/CrawlService.h"
+
+#include "core/Database.h"
+#include "core/Logger.h"
+#include "core/Util.h"
+#include "platform/PlatformAdapter.h"
+#include "platform/UrlDetector.h"
+#include "service/Notifier.h"
+
+namespace pm {
+
+nlohmann::json CrawlService::addProduct(const std::string& url, bool hasTarget,
+                                        double targetPrice, const std::string& note,
+                                        std::string& error, int& code) {
+    if (hasTarget && !(targetPrice > 0)) {
+        error = "目标价必须大于 0";
+        code = 400;
+        return nlohmann::json();
+    }
+
+    std::string detectError;
+    auto detected = detectProductUrl(url, config_, detectError);
+    if (!detected) {
+        error = detectError;
+        code = 400;
+        return nlohmann::json();
+    }
+
+    if (auto existing = db_.findProduct(detected->platform, detected->productId)) {
+        error = "该商品已在监控列表中";
+        code = 409;
+        return nlohmann::json();
+    }
+
+    Product product;
+    product.platform = detected->platform;
+    product.productId = detected->productId;
+    product.url = detected->url;
+    product.note = note;
+    product.hasTarget = hasTarget;
+    product.targetPrice = hasTarget ? targetPrice : 0.0;
+    product.enabled = true;
+    product.createdAt = nowSeconds();
+    product.updatedAt = product.createdAt;
+
+    FetchResult fetchResult;
+    if (auto adapter = createAdapter(product.platform, config_)) {
+        fetchResult = adapter->fetch(product.productId, true);
+    } else {
+        fetchResult.error = "不支持的平台: " + product.platform;
+    }
+
+    const int64_t checkedAt = nowSeconds();
+    product.hasLastChecked = true;
+    product.lastCheckedAt = checkedAt;
+
+    if (fetchResult.ok) {
+        product.title = fetchResult.title;
+        product.shopName = fetchResult.shopName;
+        product.imageUrl = fetchResult.imageUrl;
+        product.hasLastPrice = true;
+        product.lastPrice = fetchResult.price;
+        product.hasLastStock = true;
+        product.lastInStock = fetchResult.inStock;
+        product.hasLastCapture = true;
+        product.lastCaptureAt = checkedAt;
+        product.lastError.clear();
+    } else {
+        product.lastError = fetchResult.error;
+    }
+
+    if (!db_.insertProduct(product)) {
+        error = db_.lastError();
+        code = 500;
+        return nlohmann::json();
+    }
+
+    if (fetchResult.ok) {
+        PriceRecord record;
+        record.productId = product.id;
+        record.price = fetchResult.price;
+        record.hasOriginal = fetchResult.hasOriginal;
+        record.originalPrice = fetchResult.originalPrice;
+        record.inStock = fetchResult.inStock;
+        record.capturedAt = checkedAt;
+        record.raw = fetchResult.raw;
+        if (!db_.addPriceRecord(record)) {
+            logWarn("保存首次价格失败: " + db_.lastError());
+        }
+        db_.addCrawlLog(product.id, true, "");
+    } else {
+        db_.addCrawlLog(product.id, false, fetchResult.error);
+        logWarn("新增商品时首次采集失败: " + product.displayTitle() + " - " +
+                fetchResult.error);
+    }
+
+    code = 201;
+    return productToJson(product);
+}
+
+nlohmann::json CrawlService::listProducts() {
+    nlohmann::json list = nlohmann::json::array();
+    for (const auto& product : db_.listProducts()) {
+        list.push_back(productToJson(product));
+    }
+    return list;
+}
+
+nlohmann::json CrawlService::getProduct(long long id, std::string& error, int& code) {
+    auto product = db_.getProduct(id);
+    if (!product) {
+        error = "商品不存在";
+        code = 404;
+        return nlohmann::json();
+    }
+    code = 200;
+    return productToJson(*product);
+}
+
+nlohmann::json CrawlService::updateProduct(long long id, const nlohmann::json& patch,
+                                           std::string& error, int& code) {
+    auto product = db_.getProduct(id);
+    if (!product) {
+        error = "商品不存在";
+        code = 404;
+        return nlohmann::json();
+    }
+
+    bool hasTarget = product->hasTarget;
+    double targetPrice = product->targetPrice;
+    std::string note = product->note;
+    bool enabled = product->enabled;
+
+    if (patch.contains("targetPrice")) {
+        const auto& value = patch.at("targetPrice");
+        if (value.is_null()) {
+            hasTarget = false;
+            targetPrice = 0.0;
+        } else if (value.is_number()) {
+            double parsed = value.get<double>();
+            if (!(parsed > 0)) {
+                error = "目标价必须大于 0";
+                code = 400;
+                return nlohmann::json();
+            }
+            hasTarget = true;
+            targetPrice = parsed;
+        } else {
+            error = "targetPrice 必须是数字或 null";
+            code = 400;
+            return nlohmann::json();
+        }
+    }
+    if (patch.contains("note")) {
+        if (!patch.at("note").is_string()) {
+            error = "note 必须是字符串";
+            code = 400;
+            return nlohmann::json();
+        }
+        note = patch.at("note").get<std::string>();
+    }
+    if (patch.contains("enabled")) {
+        if (!patch.at("enabled").is_boolean()) {
+            error = "enabled 必须是布尔值";
+            code = 400;
+            return nlohmann::json();
+        }
+        enabled = patch.at("enabled").get<bool>();
+    }
+
+    if (!db_.updateProductSettings(id, hasTarget, targetPrice, note, enabled)) {
+        error = db_.lastError();
+        code = 500;
+        return nlohmann::json();
+    }
+
+    auto updated = db_.getProduct(id);
+    code = 200;
+    return updated ? productToJson(*updated) : nlohmann::json();
+}
+
+nlohmann::json CrawlService::deleteProduct(long long id, std::string& error,
+                                           int& code) {
+    if (!db_.getProduct(id)) {
+        error = "商品不存在";
+        code = 404;
+        return nlohmann::json();
+    }
+    if (!db_.deleteProduct(id)) {
+        error = db_.lastError();
+        code = 500;
+        return nlohmann::json();
+    }
+    code = 200;
+    return nlohmann::json{{"id", id}};
+}
+
+nlohmann::json CrawlService::refreshProduct(long long id, std::string& error,
+                                            int& code) {
+    std::string crawlError;
+    if (!crawl(id, crawlError)) {
+        error = crawlError;
+        code = 502;
+        return nlohmann::json();
+    }
+    return getProduct(id, error, code);
+}
+
+bool CrawlService::crawl(long long id, std::string& error) {
+    auto product = db_.getProduct(id);
+    if (!product) {
+        error = "商品不存在";
+        return false;
+    }
+
+    auto previous = db_.latestPrice(id);
+    const bool withMeta = product->title.empty() || product->imageUrl.empty();
+
+    FetchResult fetchResult;
+    if (auto adapter = createAdapter(product->platform, config_)) {
+        fetchResult = adapter->fetch(product->productId, withMeta);
+    } else {
+        fetchResult.error = "不支持的平台: " + product->platform;
+    }
+
+    const int64_t checkedAt = nowSeconds();
+
+    if (!fetchResult.ok) {
+        db_.updateCheckStatus(id, checkedAt, fetchResult.error);
+        db_.addCrawlLog(id, false, fetchResult.error);
+        error = fetchResult.error;
+        return false;
+    }
+
+    if (!fetchResult.title.empty() || !fetchResult.imageUrl.empty() ||
+        !fetchResult.shopName.empty()) {
+        db_.updateProductMeta(id, fetchResult.title, fetchResult.shopName,
+                              fetchResult.imageUrl);
+    }
+
+    PriceRecord record;
+    record.productId = id;
+    record.price = fetchResult.price;
+    record.hasOriginal = fetchResult.hasOriginal;
+    record.originalPrice = fetchResult.originalPrice;
+    record.inStock = fetchResult.inStock;
+    record.capturedAt = checkedAt;
+    record.raw = fetchResult.raw;
+
+    if (!db_.addPriceRecord(record)) {
+        error = db_.lastError();
+        db_.updateCheckStatus(id, checkedAt, error);
+        return false;
+    }
+
+    db_.updateCheckStatus(id, checkedAt, "");
+    db_.addCrawlLog(id, true, "");
+    notifier_.evaluate(*product, record, previous, db_);
+    return true;
+}
+
+nlohmann::json CrawlService::priceHistory(long long id, long long from, long long to,
+                                          int limit, std::string& error, int& code) {
+    auto product = db_.getProduct(id);
+    if (!product) {
+        error = "商品不存在";
+        code = 404;
+        return nlohmann::json();
+    }
+
+    auto records = db_.priceHistory(id, from, to, limit);
+
+    nlohmann::json list = nlohmann::json::array();
+    double minPrice = 0.0;
+    double maxPrice = 0.0;
+    double sum = 0.0;
+    int validCount = 0;
+    for (const auto& record : records) {
+        list.push_back(priceToJson(record));
+        if (record.price > 0) {
+            if (validCount == 0 || record.price < minPrice) minPrice = record.price;
+            if (validCount == 0 || record.price > maxPrice) maxPrice = record.price;
+            sum += record.price;
+            ++validCount;
+        }
+    }
+
+    nlohmann::json summary{
+        {"count", records.size()},
+        {"min", validCount > 0 ? nlohmann::json(round2(minPrice)) : nlohmann::json(nullptr)},
+        {"max", validCount > 0 ? nlohmann::json(round2(maxPrice)) : nlohmann::json(nullptr)},
+        {"avg", validCount > 0 ? nlohmann::json(round2(sum / validCount))
+                               : nlohmann::json(nullptr)},
+    };
+
+    code = 200;
+    return nlohmann::json{
+        {"product", productToJson(*product)},
+        {"records", list},
+        {"summary", summary},
+    };
+}
+
+nlohmann::json CrawlService::stats() {
+    Stats stats = db_.getStats();
+    return nlohmann::json{
+        {"products", stats.products},
+        {"enabled", stats.enabled},
+        {"records", stats.records},
+        {"records24h", stats.records24h},
+        {"intervalMinutes", config_.intervalMinutes},
+        {"notifierEnabled", notifier_.enabled()},
+        {"taobaoCookieConfigured", !config_.taobao.cookie.empty()},
+    };
+}
+
+}  // namespace pm

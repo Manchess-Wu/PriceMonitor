@@ -1,0 +1,29 @@
+[Unit]
+Description=PriceMonitor 商品价格监控服务
+Documentation=https://github.com/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pricemonitor
+Group=pricemonitor
+WorkingDirectory=/opt/pricemonitor
+ExecStart=/opt/pricemonitor/PriceMonitor /opt/pricemonitor/config/config.json
+Restart=always
+RestartSec=5
+Environment=TZ=Asia/Shanghai
+# pricemonitor 是 --no-create-home 的系统用户，HOME 指向不存在的目录时
+# Chrome 的 crashpad 启动即 SIGTRAP 崩溃（表现为“浏览器启动超时”，
+# 淘宝因此回退到无 Cookie 的 HTTP 请求并提示未登录）。这里指到可写目录。
+Environment=HOME=/opt/pricemonitor/data
+Environment=XDG_CONFIG_HOME=/opt/pricemonitor/data/.config
+# 树莓派 4B 建议限制资源，避免采集抖动影响系统
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/pricemonitor/data
+
+[Install]
+WantedBy=multi-user.target

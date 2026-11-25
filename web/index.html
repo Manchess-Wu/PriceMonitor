@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PriceMonitor · 商品价格监控</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e17;
+    --panel: #111827;
+    --panel-2: #162034;
+    --border: #243049;
+    --text: #e6edf7;
+    --muted: #8a9ab3;
+    --accent: #38bdf8;
+    --accent-2: #6366f1;
+    --green: #34d399;
+    --red: #f87171;
+    --amber: #fbbf24;
+    --radius: 16px;
+    --shadow: 0 16px 40px rgba(0, 0, 0, .45);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  .bg {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background:
+      radial-gradient(900px 500px at 12% -10%, rgba(56, 189, 248, .16), transparent 60%),
+      radial-gradient(800px 500px at 88% 0%, rgba(99, 102, 241, .16), transparent 60%),
+      linear-gradient(180deg, #0a0e17, #080b12 60%);
+  }
+  header {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 28px 24px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 42px; height: 42px; border-radius: 13px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: grid; place-items: center;
+    font-weight: 800; font-size: 18px; color: #051018;
+    box-shadow: 0 8px 24px rgba(56, 189, 248, .3);
+  }
+  .brand h1 { margin: 0; font-size: 20px; letter-spacing: .3px; }
+  .brand p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+  .status {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--muted);
+    background: rgba(17, 24, 39, .7);
+    border: 1px solid var(--border);
+    padding: 7px 12px; border-radius: 999px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 4px rgba(251,191,36,.12); }
+  .dot.on { background: var(--green); box-shadow: 0 0 0 4px rgba(52,211,153,.12); }
+  .dot.off { background: var(--red); box-shadow: 0 0 0 4px rgba(248,113,113,.12); }
+  main { max-width: 1240px; margin: 0 auto; padding: 8px 24px 40px; }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    margin: 12px 0 18px;
+  }
+  .stat {
+    background: linear-gradient(180deg, rgba(22, 32, 52, .9), rgba(17, 24, 39, .9));
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+  }
+  .stat .label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .stat .value { font-size: 26px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .stat .value small { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+  .notice {
+    display: flex; gap: 10px; align-items: flex-start;
+    background: rgba(251, 191, 36, .08);
+    border: 1px solid rgba(251, 191, 36, .3);
+    color: #fcd34d; border-radius: 12px;
+    padding: 12px 14px; font-size: 13px; line-height: 1.6;
+    margin-bottom: 18px;
+  }
+  .notice code { background: rgba(0,0,0,.3); padding: 1px 5px; border-radius: 5px; }
+  .toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap; margin-bottom: 16px;
+  }
+  .filters { display: flex; gap: 8px; background: rgba(17,24,39,.7); border: 1px solid var(--border); padding: 4px; border-radius: 12px; }
+  .filters button {
+    background: transparent; border: 0; color: var(--muted);
+    padding: 7px 14px; border-radius: 9px; font-size: 13px; cursor: pointer;
+    transition: all .18s ease;
+  }
+  .filters button.active { background: rgba(56,189,248,.15); color: var(--accent); }
+  .search {
+    flex: 1; min-width: 200px; max-width: 320px;
+    display: flex; align-items: center; gap: 8px;
+    background: rgba(17,24,39,.7); border: 1px solid var(--border);
+    border-radius: 12px; padding: 0 12px;
+  }
+  .search input {
+    background: transparent; border: 0; outline: 0; color: var(--text);
+    padding: 10px 0; width: 100%; font-size: 13px;
+  }
+  .search svg { opacity: .5; flex: none; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: linear-gradient(180deg, rgba(22, 32, 52, .95), rgba(15, 22, 37, .95));
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+  .card:hover { transform: translateY(-2px); border-color: #31415f; box-shadow: var(--shadow); }
+  .thumb {
+    height: 150px; background: linear-gradient(135deg, #1b2740, #121a2b);
+    display: grid; place-items: center; position: relative; overflow: hidden;
+  }
+  .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; padding: 12px; }
+  .thumb .ph { font-size: 34px; font-weight: 800; color: rgba(255,255,255,.12); letter-spacing: 4px; }
+  .body { padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+  .row-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .badge {
+    font-size: 11px; padding: 3px 8px; border-radius: 999px;
+    border: 1px solid transparent; font-weight: 600;
+  }
+  .badge.jd { color: #f87171; background: rgba(248,113,113,.1); border-color: rgba(248,113,113,.3); }
+  .badge.taobao { color: #fb923c; background: rgba(251,146,60,.1); border-color: rgba(251,146,60,.3); }
+  .badge.tmall { color: #f472b6; background: rgba(244,114,182,.1); border-color: rgba(244,114,182,.3); }
+  .pid { font-size: 11px; color: #566580; font-variant-numeric: tabular-nums; }
+  .title {
+    color: var(--text); text-decoration: none; font-size: 14px; line-height: 1.5;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; min-height: 42px;
+  }
+  .title:hover { color: var(--accent); }
+  .shop { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .price-row { display: flex; align-items: baseline; gap: 10px; margin-top: 2px; }
+  .price { font-size: 24px; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -.5px; }
+  .price.hit { color: var(--green); }
+  .change { font-size: 12px; padding: 2px 7px; border-radius: 6px; font-weight: 600; }
+  .change.down { color: var(--green); background: rgba(52,211,153,.12); }
+  .change.up { color: var(--red); background: rgba(248,113,113,.12); }
+  .change.flat { color: var(--muted); background: rgba(138,154,179,.12); }
+  .meta { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .meta .err { color: #fca5a5; line-height: 1.5; word-break: break-all;
+    background: rgba(248,113,113,.08); border-radius: 8px; padding: 6px 8px; }
+  .actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
+  .btn {
+    border: 1px solid var(--border); background: rgba(22,32,52,.8);
+    color: var(--text); border-radius: 10px; padding: 8px 10px;
+    font-size: 12px; cursor: pointer; transition: all .16s ease; flex: 1;
+  }
+  .btn:hover { border-color: #3a4b6b; background: #1c2942; }
+  .btn.primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #04121c; border: 0; font-weight: 700; }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.danger:hover { border-color: rgba(248,113,113,.5); color: #fca5a5; background: rgba(248,113,113,.08); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .add-btn { display: flex; align-items: center; gap: 8px; padding: 10px 16px; }
+  .empty {
+    text-align: center; padding: 70px 20px; color: var(--muted);
+    border: 1px dashed var(--border); border-radius: var(--radius);
+    background: rgba(17,24,39,.4);
+  }
+  .empty h2 { color: var(--text); font-size: 18px; margin: 0 0 8px; }
+  .empty p { margin: 0 0 20px; font-size: 13px; }
+  footer { max-width: 1240px; margin: 0 auto; padding: 0 24px 32px; color: #566580; font-size: 12px; line-height: 1.8; }
+  footer code { background: rgba(255,255,255,.04); padding: 1px 5px; border-radius: 5px; }
+  .modal {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(4, 8, 15, .72);
+    backdrop-filter: blur(6px);
+    display: none; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .modal.open { display: flex; }
+  .modal-card {
+    width: 100%; max-width: 460px;
+    background: linear-gradient(180deg, #162034, #101827);
+    border: 1px solid var(--border); border-radius: 18px;
+    box-shadow: var(--shadow); padding: 22px;
+    max-height: 88vh; overflow: auto;
+  }
+  .modal-card.wide { max-width: 900px; }
+  .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+  .modal-head h3 { margin: 0; font-size: 17px; }
+  .modal-head p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+  .close { background: transparent; border: 0; color: var(--muted); font-size: 22px; cursor: pointer; line-height: 1; padding: 0 2px; }
+  .close:hover { color: var(--text); }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .field input[type=text], .field input[type=number] {
+    width: 100%; background: #0d1524; border: 1px solid var(--border);
+    border-radius: 10px; padding: 11px 12px; color: var(--text);
+    font-size: 13px; outline: 0; transition: border-color .16s ease;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .field input:disabled { color: #6b7a94; cursor: not-allowed; }
+  .field .hint { font-size: 11px; color: #566580; margin-top: 6px; line-height: 1.5; }
+  .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; }
+  .switch-row span { font-size: 13px; }
+  .switch { position: relative; width: 42px; height: 24px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: #263450; border-radius: 999px; cursor: pointer; transition: .2s; }
+  .slider::before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; background: #9fb0c9; border-radius: 50%; transition: .2s; }
+  .switch input:checked + .slider { background: rgba(56,189,248,.35); }
+  .switch input:checked + .slider::before { transform: translateX(18px); background: var(--accent); }
+  .modal-actions { display: flex; gap: 10px; margin-top: 20px; }
+  .modal-actions .btn { padding: 11px; font-size: 13px; }
+  .summary { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip {
+    background: rgba(22,32,52,.9); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 12px; font-size: 12px; color: var(--muted);
+  }
+  .chip b { color: var(--text); font-size: 14px; margin-left: 6px; font-variant-numeric: tabular-nums; }
+  #chartNode { width: 100%; height: 420px; }
+  .toasts { position: fixed; right: 20px; bottom: 20px; z-index: 80; display: flex; flex-direction: column; gap: 8px; }
+  .toast {
+    background: #162034; border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    color: var(--text); padding: 12px 16px; border-radius: 10px; font-size: 13px;
+    box-shadow: var(--shadow); animation: slideIn .22s ease; max-width: 340px;
+  }
+  .toast.error { border-left-color: var(--red); }
+  .toast.success { border-left-color: var(--green); }
+  @keyframes slideIn { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @media (max-width: 640px) {
+    header { padding: 20px 16px 8px; }
+    main { padding: 8px 16px 32px; }
+    .grid { grid-template-columns: 1fr; }
+    #chartNode { height: 320px; }
+  }
+</style>
+</head>
+<body>
+<div class="bg"></div>
+
+<header>
+  <div class="brand">
+    <div class="logo">¥</div>
+    <div>
+      <h1>PriceMonitor</h1>
+      <p>京东 / 淘宝 / 天猫 · 每小时自动采集价格</p>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">连接中…</span></div>
+    <button class="btn primary add-btn" id="openAdd">＋ 添加商品</button>
+  </div>
+</header>
+
+<main>
+  <section class="stats">
+    <div class="stat"><div class="label">监控商品</div><div class="value" id="statProducts">--</div></div>
+    <div class="stat"><div class="label">启用中</div><div class="value" id="statEnabled">--</div></div>
+    <div class="stat"><div class="label">历史价格记录</div><div class="value" id="statRecords">--</div></div>
+    <div class="stat"><div class="label">近 24 小时采集</div><div class="value" id="statToday">--</div></div>
+  </section>
+
+  <div class="notice" id="cookieNotice" hidden>
+    <span>⚠️</span>
+    <div>尚未配置淘宝 Cookie，淘宝/天猫商品将无法采集。请在 <code>config/config.json</code> 的
+      <code>crawler.taobao.cookie</code> 中填入浏览器登录后的 Cookie 并重启服务。</div>
+  </div>
+
+  <section class="toolbar">
+    <div class="filters" id="filters">
+      <button data-filter="all" class="active">全部</button>
+      <button data-filter="enabled">启用</button>
+      <button data-filter="disabled">停用</button>
+    </div>
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+      <input id="searchInput" type="text" placeholder="搜索商品名称 / 店铺 / ID">
+    </div>
+    <button class="btn" id="reloadBtn" style="flex:none;padding:10px 16px">刷新列表</button>
+  </section>
+
+  <section class="grid" id="grid"></section>
+
+  <div class="empty" id="empty" hidden>
+    <h2>还没有监控商品</h2>
+    <p>粘贴京东或淘宝商品链接，系统会自动识别平台与商品 ID，并开始按小时采集价格。</p>
+    <button class="btn primary" style="flex:none;padding:11px 20px" onclick="document.getElementById('openAdd').click()">添加第一个商品</button>
+  </div>
+</main>
+
+<footer>
+  PriceMonitor · 数据保存在 SQLite，采集间隔可在 <code>config/config.json</code> 调整 ·
+  价格记录仅供参考，请以商品页面为准
+</footer>
+
+<!-- 添加 / 编辑 -->
+<div class="modal" id="productModal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div>
+        <h3 id="modalTitle">添加监控商品</h3>
+        <p id="modalSub">支持 item.jd.com、item.taobao.com、detail.tmall.com 及短链接</p>
+      </div>
+      <button class="close" data-close="productModal">×</button>
+    </div>
+    <form id="productForm">
+      <div class="field">
+        <label>商品链接</label>
+        <input type="text" name="url" id="urlInput" placeholder="https://item.jd.com/100012043978.html" autocomplete="off">
+        <div class="hint" id="urlHint">粘贴商品详情页链接即可，支持京东 / 淘宝 / 天猫短链</div>
+      </div>
+      <div class="field">
+        <label>目标价（可选，低于等于该价格时提醒）</label>
+        <input type="number" name="targetPrice" id="targetInput" step="0.01" min="0" placeholder="例如 1999">
+      </div>
+      <div class="field">
+        <label>备注（可选）</label>
+        <input type="text" name="note" id="noteInput" maxlength="200" placeholder="例如：送给爸妈的，降到 1500 以下再买">
+      </div>
+      <div class="switch-row" id="enabledRow" hidden>
+        <span>启用定时采集</span>
+        <label class="switch"><input type="checkbox" id="enabledInput" checked><span class="slider"></span></label>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn" data-close="productModal">取消</button>
+        <button type="submit" class="btn primary" id="submitBtn">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- 价格走势 -->
+<div class="modal" id="chartModal">
+  <div class="modal-card wide">
+    <div class="modal-head">
+      <div>
+        <h3 id="chartTitle">价格走势</h3>
+        <p id="chartSub"></p>
+      </div>
+      <button class="close" data-close="chartModal">×</button>
+    </div>
+    <div class="summary" id="chartSummary"></div>
+    <div id="chartNode"></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  const PLATFORM_LABEL = { jd: "京东", taobao: "淘宝", tmall: "天猫" };
+  const state = { products: [], stats: null, filter: "all", keyword: "", editing: null, chart: null };
+  let pollingTimer = null;
+
+  const $ = (id) => document.getElementById(id);
+  const grid = $("grid");
+  const emptyBox = $("empty");
+  const productModal = $("productModal");
+  const chartModal = $("chartModal");
+  const form = $("productForm");
+
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    })[c]);
+  }
+
+  function fmtPrice(value) {
+    if (value == null) return "--";
+    return Number(value).toFixed(2);
+  }
+
+  function fmtDateTime(ts) {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    const pad = (n) => String(n).padStart(2, "0");
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+      " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+  }
+
+  function relTime(ts) {
+    if (!ts) return "未采集";
+    const diff = Date.now() / 1000 - ts;
+    if (diff < 60) return "刚刚";
+    if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
+    if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
+    return Math.floor(diff / 86400) + " 天前";
+  }
+
+  function toast(message, type) {
+    const node = document.createElement("div");
+    node.className = "toast" + (type ? " " + type : "");
+    node.textContent = message;
+    $("toasts").appendChild(node);
+    setTimeout(() => {
+      node.style.transition = "opacity .25s ease, transform .25s ease";
+      node.style.opacity = "0";
+      node.style.transform = "translateY(6px)";
+      setTimeout(() => node.remove(), 260);
+    }, 3200);
+  }
+
+  async function api(path, options) {
+    const opts = Object.assign({ headers: {} }, options || {});
+    if (opts.body) opts.headers["Content-Type"] = "application/json";
+    const resp = await fetch("/api" + path, opts);
+    let payload = null;
+    try { payload = await resp.json(); } catch (e) { payload = null; }
+    if (!resp.ok || !payload || payload.ok !== true) {
+      const message = payload && payload.error ? payload.error : ("HTTP " + resp.status);
+      throw new Error(message);
+    }
+    return payload.data;
+  }
+
+  function setStatus(online, text) {
+    const dot = $("statusDot");
+    dot.className = "dot " + (online ? "on" : "off");
+    $("statusText").textContent = online ? (text || "服务正常") : (text || "连接失败");
+  }
+
+  function renderStats() {
+    if (!state.stats) return;
+    $("statProducts").textContent = state.stats.products;
+    $("statEnabled").textContent = state.stats.enabled;
+    $("statRecords").textContent = state.stats.records;
+    $("statToday").textContent = state.stats.records24h;
+    $("cookieNotice").hidden = !!state.stats.taobaoCookieConfigured;
+  }
+
+  function changeBadge(product) {
+    if (product.changePercent == null) return "";
+    const value = Number(product.changePercent);
+    const cls = value < 0 ? "down" : value > 0 ? "up" : "flat";
+    const arrow = value < 0 ? "↓" : value > 0 ? "↑" : "→";
+    return '<span class="change ' + cls + '">' + arrow + " " +
+      Math.abs(value).toFixed(2) + "%</span>";
+  }
+
+  function cardHtml(product) {
+    const label = PLATFORM_LABEL[product.platform] || product.platform;
+    const platformClass = ["jd", "taobao", "tmall"].includes(product.platform) ? product.platform : "jd";
+    const hasPrice = product.lastPrice != null;
+    const priceClass = "price" +
+      (hasPrice && product.targetPrice != null && product.lastPrice <= product.targetPrice ? " hit" : "");
+    const targetText = product.targetPrice == null
+      ? "未设置目标价"
+      : "目标价 ¥" + fmtPrice(product.targetPrice);
+    const image = '<div class="ph">' + esc(label) + "</div>" +
+      (product.imageUrl
+        ? '<img loading="lazy" src="' + esc(product.imageUrl) +
+          '" alt="" onerror="this.style.display=\'none\'">'
+        : "");
+
+    return '' +
+      '<article class="card">' +
+        '<div class="thumb">' + image + "</div>" +
+        '<div class="body">' +
+          '<div class="row-top">' +
+            '<span class="badge ' + platformClass + '">' + esc(label) + "</span>" +
+            '<span class="pid">#' + esc(product.productId) + "</span>" +
+          "</div>" +
+          '<a class="title" href="' + esc(product.url) + '" target="_blank" rel="noopener">' +
+            esc(product.title) + "</a>" +
+          (product.shopName ? '<div class="shop">' + esc(product.shopName) + "</div>" : "") +
+          '<div class="price-row">' +
+            '<span class="' + priceClass + '">' + (hasPrice ? "¥" + fmtPrice(product.lastPrice) : "未采集") + "</span>" +
+            changeBadge(product) +
+          "</div>" +
+          '<div class="meta">' +
+            "<span>" + targetText + "</span>" +
+            "<span>最后采集：" + esc(relTime(product.lastCheckedAt)) +
+              (product.lastCheckedAt ? "（" + fmtDateTime(product.lastCheckedAt) + "）" : "") + "</span>" +
+            (product.note ? "<span>备注：" + esc(product.note) + "</span>" : "") +
+            (product.lastError ? '<span class="err">' + esc(product.lastError) + "</span>" : "") +
+            (product.enabled ? "" : '<span style="color:#fbbf24">已停用</span>') +
+          "</div>" +
+          '<div class="actions">' +
+            '<button class="btn" data-act="chart" data-id="' + product.id + '">走势</button>' +
+            '<button class="btn" data-act="refresh" data-id="' + product.id + '">采集</button>' +
+            '<button class="btn" data-act="edit" data-id="' + product.id + '">编辑</button>' +
+            '<button class="btn danger" data-act="delete" data-id="' + product.id + '">删除</button>' +
+          "</div>" +
+        "</div>" +
+      "</article>";
+  }
+
+  function renderProducts() {
+    const keyword = state.keyword.trim().toLowerCase();
+    const items = state.products.filter((product) => {
+      if (state.filter === "enabled" && !product.enabled) return false;
+      if (state.filter === "disabled" && product.enabled) return false;
+      if (!keyword) return true;
+      return (product.title + " " + product.shopName + " " + product.productId + " " +
+        product.note).toLowerCase().includes(keyword);
+    });
+
+    grid.innerHTML = items.map(cardHtml).join("");
+    grid.style.display = items.length > 0 ? "grid" : "none";
+
+    if (items.length === 0) {
+      const noProducts = state.products.length === 0;
+      emptyBox.hidden = false;
+      emptyBox.querySelector("h2").textContent =
+        noProducts ? "还没有监控商品" : "没有匹配的商品";
+      emptyBox.querySelector("p").textContent = noProducts
+        ? "粘贴京东或淘宝商品链接，系统会自动识别平台与商品 ID，并开始按小时采集价格。"
+        : "试试更换搜索关键词或筛选条件。";
+      emptyBox.querySelector("button").style.display = noProducts ? "inline-flex" : "none";
+    } else {
+      emptyBox.hidden = true;
+    }
+  }
+
+  async function loadAll(silent) {
+    try {
+      const [list, stats] = await Promise.all([api("/products"), api("/stats")]);
+      state.products = list.items || [];
+      state.stats = stats;
+      renderStats();
+      renderProducts();
+      setStatus(true, "服务正常");
+    } catch (error) {
+      setStatus(false, "连接失败");
+      if (!silent) toast(error.message, "error");
+    }
+  }
+
+  function openProductModal(product) {
+    state.editing = product || null;
+    $("modalTitle").textContent = product ? "编辑监控商品" : "添加监控商品";
+    $("modalSub").textContent = product
+      ? "修改目标价、备注或启用状态"
+      : "支持 item.jd.com、item.taobao.com、detail.tmall.com 及短链接";
+    $("urlInput").value = product ? product.url : "";
+    $("urlInput").disabled = !!product;
+    $("urlHint").textContent = product
+      ? "商品链接不可修改，如需更换请删除后重新添加"
+      : "粘贴商品详情页链接即可，支持京东 / 淘宝 / 天猫短链";
+    $("targetInput").value = product && product.targetPrice != null ? product.targetPrice : "";
+    $("noteInput").value = product ? (product.note || "") : "";
+    $("enabledRow").hidden = !product;
+    $("enabledInput").checked = product ? !!product.enabled : true;
+    $("submitBtn").disabled = false;
+    $("submitBtn").textContent = "保存";
+    productModal.classList.add("open");
+    if (!product) setTimeout(() => $("urlInput").focus(), 60);
+  }
+
+  function closeModal(id) {
+    $(id).classList.remove("open");
+    if (id === "chartModal" && state.chart) {
+      state.chart.dispose();
+      state.chart = null;
+    }
+  }
+
+  async function submitForm(event) {
+    event.preventDefault();
+    const button = $("submitBtn");
+    const payload = {};
+
+    const targetRaw = $("targetInput").value.trim();
+    if (targetRaw) {
+      const target = Number(targetRaw);
+      if (!(target > 0)) {
+        toast("目标价必须大于 0", "error");
+        return;
+      }
+      payload.targetPrice = target;
+    } else {
+      payload.targetPrice = null;
+    }
+    payload.note = $("noteInput").value.trim();
+
+    button.disabled = true;
+    button.textContent = state.editing ? "保存中…" : "正在识别并首次采集…";
+
+    try {
+      if (state.editing) {
+        payload.enabled = $("enabledInput").checked;
+        await api("/products/" + state.editing.id, { method: "PUT", body: JSON.stringify(payload) });
+        toast("已保存修改", "success");
+      } else {
+        const url = $("urlInput").value.trim();
+        if (!url) {
+          toast("请输入商品链接", "error");
+          button.disabled = false;
+          button.textContent = "保存";
+          return;
+        }
+        payload.url = url;
+        await api("/products", { method: "POST", body: JSON.stringify(payload) });
+        toast("商品已加入监控", "success");
+      }
+      closeModal("productModal");
+      await loadAll(true);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      button.disabled = false;
+      button.textContent = "保存";
+    }
+  }
+
+  async function refreshProduct(product, button) {
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = "采集中…";
+    try {
+      const updated = await api("/products/" + product.id + "/refresh", { method: "POST" });
+      if (updated && updated.lastError) {
+        toast(updated.lastError, "error");
+      } else {
+        toast("已更新：" + (updated && updated.lastPrice != null ? "¥" + fmtPrice(updated.lastPrice) : "已采集"), "success");
+      }
+      await loadAll(true);
+    } catch (error) {
+      toast(error.message, "error");
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+
+  async function removeProduct(product) {
+    if (!window.confirm("确定删除「" + product.title + "」及其全部价格记录吗？")) return;
+    try {
+      await api("/products/" + product.id, { method: "DELETE" });
+      toast("已删除", "success");
+      await loadAll(true);
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  async function openChart(product) {
+    $("chartTitle").textContent = product.title;
+    $("chartSub").textContent = (PLATFORM_LABEL[product.platform] || product.platform) +
+      " · 商品 ID " + product.productId;
+    $("chartSummary").innerHTML = '<div class="chip">加载中…</div>';
+    $("chartNode").innerHTML = "";
+    chartModal.classList.add("open");
+
+    try {
+      const data = await api("/products/" + product.id + "/prices?limit=3000");
+      const records = data.records || [];
+      const summary = data.summary || {};
+
+      $("chartSummary").innerHTML = "" +
+        '<div class="chip">最低<b>' + (summary.min == null ? "--" : "¥" + fmtPrice(summary.min)) + "</b></div>" +
+        '<div class="chip">最高<b>' + (summary.max == null ? "--" : "¥" + fmtPrice(summary.max)) + "</b></div>" +
+        '<div class="chip">平均<b>' + (summary.avg == null ? "--" : "¥" + fmtPrice(summary.avg)) + "</b></div>" +
+        '<div class="chip">记录<b>' + summary.count + "</b></div>";
+
+      if (!records.length) {
+        $("chartNode").innerHTML = '<p style="color:var(--muted);text-align:center;padding:60px 0">暂无价格记录，等待下一次采集</p>';
+        return;
+      }
+      if (!window.echarts) {
+        $("chartNode").innerHTML = '<p style="color:var(--muted);text-align:center;padding:60px 0">ECharts 加载失败（离线环境），请联网后刷新页面</p>';
+        return;
+      }
+
+      const points = records.map((record) => [record.capturedAt * 1000, record.price]);
+      const target = product.targetPrice;
+
+      const option = {
+        backgroundColor: "transparent",
+        animationDuration: 420,
+        grid: { left: 58, right: 22, top: 20, bottom: 64 },
+        tooltip: {
+          trigger: "axis",
+          backgroundColor: "rgba(15,22,35,.96)",
+          borderColor: "#2a3752",
+          textStyle: { color: "#e6edf7", fontSize: 12 },
+          formatter: function (params) {
+            const point = params[0];
+            if (!point) return "";
+            const date = new Date(point.value[0]);
+            const pad = (n) => String(n).padStart(2, "0");
+            const text = date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" +
+              pad(date.getDate()) + " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
+            return text + "<br/><b>¥" + Number(point.value[1]).toFixed(2) + "</b>";
+          }
+        },
+        xAxis: {
+          type: "time",
+          axisLine: { lineStyle: { color: "#2a3752" } },
+          axisLabel: { color: "#8a9ab3", fontSize: 11 },
+          splitLine: { show: false }
+        },
+        yAxis: {
+          type: "value",
+          scale: true,
+          axisLabel: { color: "#8a9ab3", fontSize: 11, formatter: function (v) { return "¥" + v; } },
+          splitLine: { lineStyle: { color: "rgba(42,55,82,.55)" } }
+        },
+        series: [{
+          type: "line",
+          showSymbol: records.length < 40,
+          symbolSize: 5,
+          smooth: true,
+          lineStyle: { width: 2, color: "#38bdf8" },
+          itemStyle: { color: "#38bdf8" },
+          areaStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: "rgba(56,189,248,.32)" },
+              { offset: 1, color: "rgba(56,189,248,0)" }
+            ])
+          },
+          data: points,
+          markLine: target != null ? {
+            silent: true,
+            symbol: "none",
+            label: {
+              color: "#fbbf24",
+              fontSize: 11,
+              formatter: "目标价 ¥" + Number(target).toFixed(2)
+            },
+            lineStyle: { color: "#fbbf24", type: "dashed" },
+            data: [{ yAxis: target }]
+          } : undefined
+        }],
+        dataZoom: records.length > 60 ? [
+          { type: "inside" },
+          {
+            type: "slider", height: 18, bottom: 14,
+            borderColor: "#243049",
+            fillerColor: "rgba(56,189,248,.16)",
+            textStyle: { color: "#8a9ab3" },
+            handleStyle: { color: "#38bdf8" },
+            brushSelect: false
+          }
+        ] : []
+      };
+
+      if (state.chart) state.chart.dispose();
+      state.chart = echarts.init($("chartNode"));
+      state.chart.setOption(option);
+    } catch (error) {
+      $("chartSummary").innerHTML = "";
+      $("chartNode").innerHTML = '<p style="color:#fca5a5;text-align:center;padding:60px 0">' +
+        esc(error.message) + "</p>";
+    }
+  }
+
+  // 事件绑定
+  $("openAdd").addEventListener("click", () => openProductModal(null));
+  $("reloadBtn").addEventListener("click", () => loadAll(false));
+  form.addEventListener("submit", submitForm);
+
+  document.querySelectorAll("[data-close]").forEach((node) => {
+    node.addEventListener("click", () => closeModal(node.getAttribute("data-close")));
+  });
+
+  [productModal, chartModal].forEach((modal) => {
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) closeModal(modal.id);
+    });
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeModal("productModal");
+      closeModal("chartModal");
+    }
+  });
+
+  $("filters").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-filter]");
+    if (!button) return;
+    state.filter = button.getAttribute("data-filter");
+    document.querySelectorAll("#filters button").forEach((node) => node.classList.remove("active"));
+    button.classList.add("active");
+    renderProducts();
+  });
+
+  $("searchInput").addEventListener("input", (event) => {
+    state.keyword = event.target.value;
+    renderProducts();
+  });
+
+  grid.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-act]");
+    if (!button) return;
+    const product = state.products.find((item) => item.id === Number(button.getAttribute("data-id")));
+    if (!product) return;
+    const action = button.getAttribute("data-act");
+    if (action === "chart") openChart(product);
+    else if (action === "refresh") refreshProduct(product, button);
+    else if (action === "edit") openProductModal(product);
+    else if (action === "delete") removeProduct(product);
+  });
+
+  window.addEventListener("resize", () => {
+    if (state.chart) state.chart.resize();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) loadAll(true);
+  });
+
+  // 启动：首屏加载 + 每分钟静默刷新
+  loadAll(false);
+  pollingTimer = setInterval(() => loadAll(true), 60000);
+  window.addEventListener("beforeunload", () => clearInterval(pollingTimer));
+})();
+</script>
+</body>
+</html>

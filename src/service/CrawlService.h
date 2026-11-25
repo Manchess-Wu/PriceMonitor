@@ -40,8 +40,8 @@ public:
     bool crawl(long long id, std::string& error, bool autoCrawl = false);
 
 private:
-    // 平台并发额度：同一 IP 下京东最多 2 个、淘宝/天猫（同一家）最多 2 个，
-    // 合计最多 4 个采集同时进行。
+    // 平台并发额度：京东 1 个（降低风控概率），淘宝/天猫（同一家）2 个，
+    // 合计最多 3 个采集同时进行。
     struct CrawlLimit {
         explicit CrawlLimit(int limit) : maxActive(limit) {}
         std::mutex mutex;
@@ -58,7 +58,7 @@ private:
     Database& db_;
     Notifier& notifier_;
     CrawlerConfig config_;
-    CrawlLimit jdLimit_{2};
+    CrawlLimit jdLimit_{1};
     CrawlLimit taobaoLimit_{2};
 };
 

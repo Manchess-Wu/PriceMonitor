@@ -449,7 +449,9 @@
     $("statEnabled").textContent = state.stats.enabled;
     $("statRecords").textContent = state.stats.records;
     $("statToday").textContent = state.stats.records24h;
-    $("cookieNotice").hidden = !!state.stats.taobaoCookieConfigured;
+    // 浏览器模式靠 profile 里的登录态，不再需要手动填 Cookie
+    $("cookieNotice").hidden =
+      !!state.stats.taobaoCookieConfigured || !!state.stats.browserEnabled;
   }
 
   function changeBadge(product) {

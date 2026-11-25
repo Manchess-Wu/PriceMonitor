@@ -62,7 +62,9 @@ sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR/data" "$APP_DIR/config"
 echo "==> 安装 systemd 服务"
 sudo install -m 644 "$ROOT_DIR/deploy/pricemonitor.service" /etc/systemd/system/pricemonitor.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now pricemonitor
+sudo systemctl enable pricemonitor
+# 必须 restart：enable --now 对已运行的服务不会重新加载新二进制
+sudo systemctl restart pricemonitor
 sudo systemctl --no-pager status pricemonitor || true
 
 echo "完成。Web 管理界面: http://<设备IP>:8080"

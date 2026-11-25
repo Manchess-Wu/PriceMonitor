@@ -361,6 +361,17 @@ pid_t spawnBrowser(const BrowserClient::Options& options, const std::string& url
     args.push_back("--disable-dev-shm-usage");
     args.push_back("--no-first-run");
     args.push_back("--no-default-browser-check");
+    // 采集只需要 DOM 文本：不加载图片/字体，显著缩短详情页加载时间
+    args.push_back("--blink-settings=imagesEnabled=false");
+    args.push_back("--disable-background-networking");
+    // 多标签并发时，后台标签不被降频，否则第二个 tab 会明显慢于第一个
+    args.push_back("--disable-background-timer-throttling");
+    args.push_back("--disable-backgrounding-occluded-windows");
+    args.push_back("--disable-renderer-backgrounding");
+    args.push_back("--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling");
+    // 同站点（如两个 detail.tmall.com）的标签默认会共用一个渲染进程，
+    // 解析/渲染会互相排队；尽量让每个标签独立进程（Chrome 不支持时自动忽略）
+    args.push_back("--process-per-tab");
     args.push_back("--disable-blink-features=AutomationControlled");
     args.push_back("--remote-debugging-port=" + std::to_string(port));
     args.push_back("--remote-allow-origins=*");

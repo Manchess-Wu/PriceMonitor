@@ -57,7 +57,7 @@ bool AppContext::init(const std::string& configPath, const std::string& baseDir,
     logInfo("PriceMonitor 已初始化，数据库: " + config_.dbPath);
     logInfo("Web 目录: " + documentRoot_);
     logInfo("采集间隔: " + std::to_string(config_.crawler.intervalMinutes) +
-            " 分钟（可按商品单独设置），并发 4（京东 2 / 淘宝天猫 2）");
+            " 分钟（可按商品单独设置），并发 3（京东 1 / 淘宝天猫 2）");
     if (!config_.crawler.browser.enabled && config_.crawler.taobao.cookie.empty()) {
         logWarn("未配置淘宝 Cookie，淘宝/天猫商品将无法采集");
     }

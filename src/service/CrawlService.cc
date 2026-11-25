@@ -402,6 +402,7 @@ nlohmann::json CrawlService::stats() {
         {"intervalMinutes", config_.intervalMinutes},
         {"notifierEnabled", notifier_.enabled()},
         {"taobaoCookieConfigured", !config_.taobao.cookie.empty()},
+        {"browserEnabled", config_.browser.enabled},
     };
 }
 

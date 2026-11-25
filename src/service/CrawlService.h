@@ -1,5 +1,6 @@
 #pragma once
 
+#include <condition_variable>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -39,14 +40,26 @@ public:
     bool crawl(long long id, std::string& error, bool autoCrawl = false);
 
 private:
-    // 不加锁的实际采集逻辑；调用方必须已持有 crawlMutex_
+    // 平台并发额度：同一 IP 下京东最多 2 个、淘宝/天猫（同一家）最多 2 个，
+    // 合计最多 4 个采集同时进行。
+    struct CrawlLimit {
+        explicit CrawlLimit(int limit) : maxActive(limit) {}
+        std::mutex mutex;
+        std::condition_variable cv;
+        int active = 0;
+        int maxActive;
+    };
+
+    CrawlLimit& limitFor(const std::string& platform);
+
+    // 实际的采集逻辑；并发额度由调用方负责
     bool crawlInternal(long long id, std::string& error, bool autoCrawl);
 
     Database& db_;
     Notifier& notifier_;
     CrawlerConfig config_;
-    // 同一时刻只允许一个采集任务，保证按顺序检索，也保证手动与定时不会并发
-    std::mutex crawlMutex_;
+    CrawlLimit jdLimit_{2};
+    CrawlLimit taobaoLimit_{2};
 };
 
 }  // namespace pm

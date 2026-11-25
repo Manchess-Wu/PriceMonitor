@@ -2,7 +2,6 @@
 
 #include <cstring>
 #include <initializer_list>
-#include <nlohmann/json.hpp>
 
 #include "core/HtmlParser.h"
 #include "core/HttpClient.h"
@@ -12,15 +11,6 @@
 
 namespace pm {
 namespace {
-
-std::string jsonText(const nlohmann::json& value) {
-    if (value.is_string()) return value.get<std::string>();
-    if (value.is_number()) {
-        double number = value.get<double>();
-        return fmtPrice(number);
-    }
-    return "";
-}
 
 bool endsWith(const std::string& value, const std::string& suffix) {
     return value.size() >= suffix.size() &&
@@ -84,70 +74,12 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
     FetchResult result;
 
     const std::string itemUrl = "https://item.jd.com/" + productId + ".html";
-
-    std::vector<std::string> headers = {
-        "User-Agent: " + config_.userAgent,
-        "Referer: " + itemUrl,
-        "Accept: application/json, text/plain, */*",
-    };
-
-    // 1) 优先使用官方价格接口
-    std::string priceError;
-    const std::string priceUrl =
-        "https://p.3.cn/prices/mgets?skuIds=J_" + productId + "&type=1";
-    HttpResult priceResp =
-        HttpClient::get(priceUrl, headers, config_.jd.cookie, config_.timeoutSeconds);
-
-    if (!priceResp.error.empty()) {
-        priceError = "请求京东价格接口失败: " + priceResp.error;
-    } else if (priceResp.status < 200 || priceResp.status >= 300) {
-        priceError = "京东价格接口返回 HTTP " + std::to_string(priceResp.status);
-    } else {
-        try {
-            nlohmann::json json = nlohmann::json::parse(priceResp.body);
-            if (!json.is_array() || json.empty()) {
-                priceError = "京东价格接口返回格式异常: " + truncate(priceResp.body, 120);
-            } else {
-                const auto& item = json.at(0);
-                std::string priceText = jsonText(item.value("p", nlohmann::json()));
-                if (priceText.empty()) {
-                    priceText = jsonText(item.value("price", nlohmann::json()));
-                }
-                if (auto price = toPrice(priceText)) {
-                    result.price = *price;
-                    result.inStock = true;
-                    result.ok = true;
-                    if (item.contains("op")) {
-                        if (auto original = toPrice(jsonText(item.at("op")))) {
-                            result.hasOriginal = true;
-                            result.originalPrice = *original;
-                        }
-                    }
-                    if (!result.hasOriginal && item.contains("m")) {
-                        if (auto market = toPrice(jsonText(item.at("m")))) {
-                            result.hasOriginal = true;
-                            result.originalPrice = *market;
-                        }
-                    }
-                    nlohmann::json raw{
-                        {"source", "p.3.cn"},
-                        {"p", priceText},
-                        {"op", jsonText(item.value("op", nlohmann::json()))},
-                        {"m", jsonText(item.value("m", nlohmann::json()))},
-                    };
-                    result.raw = truncate(raw.dump(), 500);
-                } else {
-                    priceError = "京东未返回有效价格（商品可能已下架）";
-                }
-            }
-        } catch (const std::exception& e) {
-            priceError = std::string("解析京东价格失败: ") + e.what();
-        }
-    }
-
-    // 2) 价格接口不可用时，用浏览器加载详情页兜底（不需要登录）
     std::string pageHtml;
-    if (!result.ok && config_.browser.enabled) {
+    std::string pageError;
+
+    // 1) 直接用浏览器加载详情页。p.3.cn 价格接口在部分网络下长期超时
+    //    （每次白等 timeout），已移除，改为浏览器优先。
+    if (config_.browser.enabled) {
         BrowserClient browser(BrowserClient::fromConfig(config_));
         std::string html;
         std::string browserError;
@@ -162,27 +94,52 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
                 result.inStock = !contains(pageHtml, "无货");
                 result.raw = "{\"source\":\"browser\"}";
             } else if (contains(pageHtml, "频控")) {
-                browserError =
+                pageError =
                     "京东频控拦截（PC频控页）。可降低采集频率，或把 "
                     "crawler.browser.headless 设为 false 使用有头模式";
+            } else if (contains(pageHtml, "京东验证") ||
+                       contains(pageHtml, "JDR_shields")) {
+                pageError = "京东风控验证（京东验证页），请降低采集频率后重试";
             } else if (contains(pageHtml, "passport.jd.com") ||
                        contains(pageHtml, "欢迎登录")) {
-                browserError = "京东要求登录，请执行 ./PriceMonitor --login jd";
+                pageError = "京东要求登录，请执行 ./PriceMonitor --login jd";
             } else {
-                browserError = "页面中未找到价格";
+                pageError = "页面中未找到价格";
             }
+        } else {
+            pageError = "浏览器采集京东失败: " + browserError;
         }
-        if (!result.ok) {
-            result.error = priceError.empty()
-                               ? "浏览器采集京东失败: " + browserError
-                               : priceError + "；浏览器兜底失败: " + browserError;
-            return result;
+    } else {
+        pageError = "浏览器采集未启用（crawler.browser.enabled=false）";
+    }
+
+    // 2) 浏览器不可用时，用普通 HTTP 拉详情页兜底（可带登录 Cookie），
+    //    静态 HTML 里通常也内嵌了价格字段。
+    if (!result.ok) {
+        std::vector<std::string> pageHeaders = {
+            "User-Agent: " + config_.userAgent,
+            "Referer: https://www.jd.com/",
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        };
+        HttpResult page = HttpClient::get(itemUrl, pageHeaders, config_.jd.cookie,
+                                          config_.timeoutSeconds);
+        if (page.error.empty() && page.status == 200) {
+            if (pageHtml.empty()) pageHtml = page.body;
+            if (auto price = priceFromPage(pageHtml)) {
+                result.price = *price;
+                result.ok = true;
+                result.inStock = !contains(pageHtml, "无货");
+                result.raw = "{\"source\":\"http\"}";
+            }
+        } else if (pageError.empty()) {
+            pageError = page.error.empty()
+                            ? "京东详情页返回 HTTP " + std::to_string(page.status)
+                            : "请求京东详情页失败: " + page.error;
         }
-        logInfo("京东价格接口不可用，已改用浏览器采集: " + productId);
     }
 
     if (!result.ok) {
-        result.error = priceError.empty() ? "京东价格采集失败" : priceError;
+        result.error = pageError;
         return result;
     }
 

@@ -415,7 +415,7 @@ bool waitForDevtools(int port, int timeoutSeconds, pid_t pid, json& version,
         // 浏览器进程已退出（profile 被其他实例占用、可执行文件不可用等）时
         // 立即报错，避免白等一个超时周期后给出误导性的“启动超时”。
         int status = 0;
-        if (::waitpid(pid, &status, WNOHANG) == pid) {
+        if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) {
             err = "浏览器启动后立即退出，配置目录可能被其他 Chrome 实例占用";
             return false;
         }
@@ -431,6 +431,77 @@ bool waitForDevtools(int port, int timeoutSeconds, pid_t pid, json& version,
     }
     err = "浏览器启动超时，请确认 Chrome 路径正确且配置目录未被其他进程占用";
     return false;
+}
+
+// 进程内共享一个 Chrome 实例：同一 profile 只允许一个主实例，
+// 并发采集通过多个标签页（Target）复用该实例，而不是各自拉起 Chrome。
+struct SharedBrowser {
+    std::mutex mutex;
+    pid_t pid = -1;
+    int port = 0;
+    int refs = 0;
+    uint64_t generation = 0;
+};
+
+SharedBrowser& sharedBrowser() {
+    static SharedBrowser browser;
+    return browser;
+}
+
+// 获取共享浏览器（必要时启动），返回调试端口与实例代号。
+bool acquireBrowser(const BrowserClient::Options& options, int& port,
+                    uint64_t& generation, json& version, std::string& err) {
+    SharedBrowser& shared = sharedBrowser();
+    std::lock_guard<std::mutex> lock(shared.mutex);
+
+    if (shared.pid > 0 && ::kill(shared.pid, 0) == 0 &&
+        waitForDevtools(shared.port, 5, 0, version, err)) {
+        ++shared.refs;
+        port = shared.port;
+        generation = shared.generation;
+        return true;
+    }
+
+    // 已有实例不可用（退出或调试端口无响应），先清理再重建
+    if (shared.pid > 0) {
+        shutdownBrowser(shared.pid);
+        shared.pid = -1;
+        shared.port = 0;
+        shared.refs = 0;
+    }
+
+    const int newPort = reservePort();
+    if (newPort <= 0) {
+        err = "无法分配本地调试端口";
+        return false;
+    }
+    const pid_t pid = spawnBrowser(options, "about:blank", newPort,
+                                   options.headless, err);
+    if (pid < 0) return false;
+    if (!waitForDevtools(newPort, options.timeoutSeconds, pid, version, err)) {
+        shutdownBrowser(pid);
+        return false;
+    }
+    shared.pid = pid;
+    shared.port = newPort;
+    shared.refs = 1;
+    ++shared.generation;
+    port = newPort;
+    generation = shared.generation;
+    return true;
+}
+
+// 释放共享浏览器；最后一个使用者离开时关闭 Chrome。
+void releaseBrowser(uint64_t generation) {
+    SharedBrowser& shared = sharedBrowser();
+    std::lock_guard<std::mutex> lock(shared.mutex);
+    if (generation != shared.generation) return;  // 已被新一轮实例取代
+    if (shared.refs > 0) --shared.refs;
+    if (shared.refs == 0 && shared.pid > 0) {
+        shutdownBrowser(shared.pid);
+        shared.pid = -1;
+        shared.port = 0;
+    }
 }
 
 }  // namespace
@@ -455,27 +526,14 @@ BrowserClient::Options BrowserClient::fromConfig(const CrawlerConfig& config) {
 bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor,
                               std::string& html, std::string& err) {
     html.clear();
-    // 所有采集共用同一个 profile 目录，而 Chrome 的 ProcessSingleton 不允许
-    // 两个实例同时使用同一 profile：后启动的那个会把命令行转发给已有实例并
-    // 立刻退出，自己的调试端口永远不监听，最终表现为“浏览器启动超时”。
-    // 采集线程是并发的（默认 2），这里把浏览器使用串行化。
-    static std::mutex profileMutex;
-    std::lock_guard<std::mutex> profileLock(profileMutex);
-
-    const int port = reservePort();
-    if (port <= 0) {
-        err = "无法分配本地调试端口";
-        return false;
-    }
-    const pid_t pid = spawnBrowser(options_, "about:blank", port, options_.headless, err);
-    if (pid < 0) return false;
+    int port = 0;
+    uint64_t generation = 0;
+    json version;
+    if (!acquireBrowser(options_, port, generation, version, err)) return false;
 
     bool ok = false;
     WebSocketClient ws;
     do {
-        json version;
-        if (!waitForDevtools(port, options_.timeoutSeconds, pid, version, err)) break;
-
         const std::string wsUrl = version.value("webSocketDebuggerUrl", "");
         if (!startsWith(wsUrl, "ws://")) {
             err = "浏览器未提供可用的调试地址";
@@ -530,9 +588,12 @@ bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor
             "document.documentElement.outerHTML : ''; return JSON.stringify({"
             "u: location.href, t: document.title, "
             "p: h.indexOf('" + escaped + "') >= 0, "
+            "r: document.readyState, n: h.length, "
             "l: /login\\.taobao\\.com|havanaone/.test(location.href)}); })()";
+        long long lastLength = -1;
+        int stableRounds = 0;
         while (Clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
             json state;
             if (!cdpCall(ws, nextId++, "Runtime.evaluate",
                          {{"expression", stateExpr}, {"returnByValue", true}},
@@ -546,10 +607,18 @@ bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor
                 parsed.value("t", "") == "登录") {
                 break;
             }
+            // 页面已加载完成且内容长度不再变化时提前结束，避免等满整个超时
+            const long long length = parsed.value("n", 0LL);
+            if (parsed.value("r", "") == "complete" && length > 0 && length == lastLength) {
+                if (++stableRounds >= 2) break;
+            } else {
+                stableRounds = 0;
+            }
+            lastLength = length;
         }
         if (!err.empty()) break;
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
         json dump;
         if (!cdpCall(ws, nextId, "Runtime.evaluate",
                      {{"expression", "document.documentElement.outerHTML"},
@@ -560,10 +629,20 @@ bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor
         html = dump["result"].value("value", "");
         ok = !html.empty();
         if (!ok) err = "浏览器未返回页面内容";
+
+        // 共享浏览器不随单次采集关闭，必须主动关掉本任务的标签页
+        if (!targetId.empty()) {
+            std::string closeErr;
+            json ignored;
+            cdpCall(ws, nextId++, "Target.closeTarget", {{"targetId", targetId}},
+                    "", ignored, closeErr);
+        }
     } while (false);
 
     ws.close();
-    shutdownBrowser(pid);
+    // 只释放引用：实例是否健康由下一次 acquire 的端口探测决定，
+    // 不能因为单个页面失败就关掉其他并发任务正在用的浏览器
+    releaseBrowser(generation);
     return ok;
 }
 

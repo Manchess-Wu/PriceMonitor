@@ -46,11 +46,22 @@ nlohmann::json CrawlService::addProduct(const std::string& url, bool hasTarget,
     product.intervalMinutes = intervalMinutes > 0 ? intervalMinutes : 0;
 
     FetchResult fetchResult;
+    CrawlLimit& limit = limitFor(product.platform);
+    {
+        std::unique_lock<std::mutex> lock(limit.mutex);
+        limit.cv.wait(lock, [&limit] { return limit.active < limit.maxActive; });
+        ++limit.active;
+    }
     if (auto adapter = createAdapter(product.platform, config_)) {
         fetchResult = adapter->fetch(product.productId, true);
     } else {
         fetchResult.error = "不支持的平台: " + product.platform;
     }
+    {
+        std::lock_guard<std::mutex> lock(limit.mutex);
+        --limit.active;
+    }
+    limit.cv.notify_one();
 
     const int64_t checkedAt = nowSeconds();
     product.hasLastChecked = true;
@@ -219,18 +230,42 @@ nlohmann::json CrawlService::deleteProduct(long long id, std::string& error,
     return nlohmann::json{{"id", id}};
 }
 
+CrawlService::CrawlLimit& CrawlService::limitFor(const std::string& platform) {
+    // 淘宝与天猫属于同一家，共用 2 个并发额度
+    return platform == "jd" ? jdLimit_ : taobaoLimit_;
+}
+
 nlohmann::json CrawlService::refreshProduct(long long id, std::string& error,
                                             int& code) {
-    // 手动检索：已有采集在跑时直接拒绝，不排队、不打断正在进行的采集
-    std::unique_lock<std::mutex> lock(crawlMutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        error = "正在检索价格，请等待本次采集完成后再试";
-        code = 409;
+    auto product = db_.getProduct(id);
+    if (!product) {
+        error = "商品不存在";
+        code = 404;
         return nlohmann::json();
     }
 
+    // 手动检索：该平台额度已满时直接拒绝弹窗，不排队、不打断已开始的采集
+    CrawlLimit& limit = limitFor(product->platform);
+    {
+        std::lock_guard<std::mutex> lock(limit.mutex);
+        if (limit.active >= limit.maxActive) {
+            error = "该平台已有 " + std::to_string(limit.maxActive) +
+                    " 个采集在进行，请稍后再试";
+            code = 409;
+            return nlohmann::json();
+        }
+        ++limit.active;
+    }
+
     std::string crawlError;
-    if (!crawlInternal(id, crawlError, false)) {
+    const bool ok = crawlInternal(id, crawlError, false);
+    {
+        std::lock_guard<std::mutex> lock(limit.mutex);
+        --limit.active;
+    }
+    limit.cv.notify_one();
+
+    if (!ok) {
         error = crawlError;
         code = 502;
         return nlohmann::json();
@@ -239,8 +274,27 @@ nlohmann::json CrawlService::refreshProduct(long long id, std::string& error,
 }
 
 bool CrawlService::crawl(long long id, std::string& error, bool autoCrawl) {
-    std::lock_guard<std::mutex> lock(crawlMutex_);
-    return crawlInternal(id, error, autoCrawl);
+    auto product = db_.getProduct(id);
+    if (!product) {
+        error = "商品不存在";
+        return false;
+    }
+
+    // 自动采集：额度满时等待，保证不会超过每个平台的并发上限
+    CrawlLimit& limit = limitFor(product->platform);
+    {
+        std::unique_lock<std::mutex> lock(limit.mutex);
+        limit.cv.wait(lock, [&limit] { return limit.active < limit.maxActive; });
+        ++limit.active;
+    }
+
+    const bool ok = crawlInternal(id, error, autoCrawl);
+    {
+        std::lock_guard<std::mutex> lock(limit.mutex);
+        --limit.active;
+    }
+    limit.cv.notify_one();
+    return ok;
 }
 
 bool CrawlService::crawlInternal(long long id, std::string& error, bool autoCrawl) {

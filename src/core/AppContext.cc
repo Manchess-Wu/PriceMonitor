@@ -57,7 +57,7 @@ bool AppContext::init(const std::string& configPath, const std::string& baseDir,
     logInfo("PriceMonitor 已初始化，数据库: " + config_.dbPath);
     logInfo("Web 目录: " + documentRoot_);
     logInfo("采集间隔: " + std::to_string(config_.crawler.intervalMinutes) +
-            " 分钟（可按商品单独设置），串行采集");
+            " 分钟（可按商品单独设置），并发 4（京东 2 / 淘宝天猫 2）");
     if (!config_.crawler.browser.enabled && config_.crawler.taobao.cookie.empty()) {
         logWarn("未配置淘宝 Cookie，淘宝/天猫商品将无法采集");
     }
@@ -78,9 +78,10 @@ void AppContext::startScheduler() {
     const int tickSeconds =
         std::max(5, std::min(60, config_.crawler.intervalMinutes * 60));
 
-    // 并发固定为 1：自动采集按到期顺序逐个执行，避免多个浏览器实例抢占同一 profile。
+    // 并发 4：京东最多 2 个、淘宝/天猫共用 2 个（具体额度在 CrawlService 内控制），
+    // 浏览器复用同一个 Chrome 实例的多标签页，不会再有 profile 抢占问题。
     scheduler_ = std::make_unique<Scheduler>(
-        tickSeconds, 1,
+        tickSeconds, 4,
         [this]() {
             return db_->listDueProducts(nowSeconds(), config_.crawler.intervalMinutes);
         },

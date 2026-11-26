@@ -1,5 +1,6 @@
 #include <drogon/drogon.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -107,6 +108,29 @@ int main(int argc, char** argv) {
         const fs::path profile(options.profileDir);
         if (!profile.is_absolute()) {
             options.profileDir = (fs::path(baseDir) / profile).string();
+        }
+
+        // 已安装服务时，登录态必须写进服务读取的那个 profile，
+        // 否则会出现“刚扫码登录完，服务仍提示未登录”。
+        const std::string installedConfig = "/opt/pricemonitor/config/config.json";
+        if (fs::exists(installedConfig) && !std::getenv("PM_ALLOW_LOGIN_MISMATCH")) {
+            pm::Config installed;
+            std::string installedError;
+            if (pm::Config::load(installedConfig, installed, installedError)) {
+                fs::path installedProfile(installed.crawler.browser.profileDir);
+                if (!installedProfile.is_absolute()) {
+                    installedProfile = fs::path("/opt/pricemonitor") / installedProfile;
+                }
+                if (fs::weakly_canonical(installedProfile) !=
+                    fs::weakly_canonical(fs::path(options.profileDir))) {
+                    std::cerr
+                        << "[ERROR] 本次登录会写入:\n  " << options.profileDir
+                        << "\n但已安装的服务读取的是:\n  " << installedProfile
+                        << "\n两边不互通，登录后服务仍会提示未登录。\n"
+                        << "请改用: sudo bash deploy/login.sh " << site << std::endl;
+                    return 1;
+                }
+            }
         }
         // 天猫和淘宝的登录 Cookie 分属 .tmall.com / .taobao.com 两个域，
         // 在淘宝登录不等于天猫也登录，天猫商品需要单独登录一次。

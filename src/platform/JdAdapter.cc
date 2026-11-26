@@ -42,30 +42,47 @@ std::string normalizeImage(std::string url) {
     return url;
 }
 
-std::optional<double> toPrice(const std::string& text) {
-    if (text.empty()) return std::nullopt;
-    try {
-        double value = std::stod(text);
-        if (value > 0) return value;
-    } catch (const std::exception&) {
+double parsePriceText(const std::string& text) {
+    std::string cleaned;
+    cleaned.reserve(text.size());
+    for (char ch : text) {
+        if (ch != ',') cleaned.push_back(ch);  // 去掉千分位
     }
-    return std::nullopt;
+    try {
+        return std::stod(cleaned);
+    } catch (const std::exception&) {
+        return 0;
+    }
 }
 
 // 从详情页 HTML 中提取价格（浏览器渲染后的页面兜底）。
 std::optional<double> priceFromPage(const std::string& html) {
     static const char* patterns[] = {
-        R"re(class="product-price--value">\s*([0-9]+(?:\.[0-9]+)?))re",
-        R"re(class="price J-p-\d+"[^>]*>\s*([0-9]+(?:\.[0-9]+)?))re",
+        // 新版页面：<div class="product-price--value">¥2,498.00</div>
+        R"re(class="product-price--value"[^>]*>\s*[￥¥]?\s*(?:<[^>]*>\s*)*[￥¥]?\s*([0-9][0-9,]*(?:\.[0-9]+)?))re",
+        // 价格块：<p class="price" id="priceSale2">¥<em>2,498.00</em></p>
+        // 也覆盖老版 <span class="price J-p-100...">￥2,498.00</span>
+        R"re(class="[^"]*\bprice\b[^"]*"[^>]*>\s*[￥¥]?\s*(?:<[^>]*>\s*)*[￥¥]?\s*([0-9][0-9,]*(?:\.[0-9]+)?))re",
+        R"re("jdPrice"\s*:\s*"([0-9][0-9,]*(?:\.[0-9]+)?)")re",
         R"re("p"\s*:\s*"([0-9]+(?:\.[0-9]+)?)")re",
         R"re("price"\s*:\s*"([0-9]+(?:\.[0-9]+)?)")re",
     };
     for (const char* pattern : patterns) {
         if (auto match = regexGroup(html, pattern)) {
-            if (auto price = toPrice(*match)) return price;
+            const double price = parsePriceText(*match);
+            if (price > 0) return price;
         }
     }
     return std::nullopt;
+}
+
+// 京东对未登录请求会把价格中间的数字替换成 ?（如 1??00），说明需要登录后查看。
+bool hasMaskedPrice(const std::string& html, std::string* raw = nullptr) {
+    if (auto match = regexGroup(html, R"re("jdPrice"\s*:\s*"([^"]*)")re")) {
+        if (raw) *raw = *match;
+        return match->find('?') != std::string::npos;
+    }
+    return false;
 }
 
 }  // namespace
@@ -73,7 +90,10 @@ std::optional<double> priceFromPage(const std::string& html) {
 FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
     FetchResult result;
 
-    const std::string itemUrl = "https://item.jd.com/" + productId + ".html";
+    // item.jd.com 现在会返回一个跳转壳，把 PC 详情页转到 M 站；
+    // 直接访问 M 站商品页，避免被重定向到首页。
+    const std::string itemUrl =
+        "https://item.m.jd.com/product/" + productId + ".html";
     std::string pageHtml;
     std::string pageError;
 
@@ -83,11 +103,17 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
         BrowserClient browser(BrowserClient::fromConfig(config_));
         std::string html;
         std::string browserError;
-        if (browser.fetchHtml(itemUrl, "product-price--value", html, browserError)) {
+        if (browser.fetchHtml(itemUrl, "priceSale2", html, browserError)) {
             pageHtml = std::move(html);
             logInfo("京东页面采集完成: " + std::to_string(pageHtml.size()) +
                     " 字节，登录提示=" +
                     (contains(pageHtml, "欢迎登录") ? "是" : "否"));
+            std::string pageTitle;
+            if (auto match = regexGroup(pageHtml, R"re(<title>([^<]*)</title>)re")) {
+                pageTitle = trim(*match);
+            }
+            std::string maskedRaw;
+            const bool maskedPrice = hasMaskedPrice(pageHtml, &maskedRaw);
             if (auto price = priceFromPage(pageHtml)) {
                 result.price = *price;
                 result.ok = true;
@@ -103,6 +129,12 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
             } else if (contains(pageHtml, "passport.jd.com") ||
                        contains(pageHtml, "欢迎登录")) {
                 pageError = "京东要求登录，请执行 ./PriceMonitor --login jd";
+            } else if (pageTitle.find("正品低价") != std::string::npos) {
+                pageError =
+                    "京东把商品页重定向到了首页（商品可能已下架、需要登录或仅移动端可见）";
+            } else if (maskedPrice) {
+                pageError = "京东返回了隐藏价格（" + maskedRaw +
+                            "），需要登录后查看：请执行 ./PriceMonitor --login jd 后重试";
             } else {
                 pageError = "页面中未找到价格";
             }
@@ -118,7 +150,7 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
     if (!result.ok) {
         std::vector<std::string> pageHeaders = {
             "User-Agent: " + config_.userAgent,
-            "Referer: https://www.jd.com/",
+            "Referer: https://item.m.jd.com/",
             "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         };
         HttpResult page = HttpClient::get(itemUrl, pageHeaders, config_.jd.cookie,
@@ -138,6 +170,21 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
         }
     }
 
+    if (!result.ok && !pageHtml.empty()) {
+        std::string title;
+        if (auto match = regexGroup(pageHtml, R"re(<title>([^<]*)</title>)re")) {
+            title = trim(*match);
+        }
+        size_t pos = pageHtml.find("p-price");
+        if (pos == std::string::npos) pos = pageHtml.find("price");
+        std::string excerpt;
+        if (pos != std::string::npos) {
+            const size_t start = pos > 120 ? pos - 120 : 0;
+            excerpt = pageHtml.substr(start, 360);
+        }
+        logWarn("京东页面未匹配价格，标题=" + title + "，摘录=" + excerpt);
+    }
+
     if (!result.ok) {
         result.error = pageError;
         return result;
@@ -149,7 +196,7 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
     if (pageHtml.empty()) {
         std::vector<std::string> pageHeaders = {
             "User-Agent: " + config_.userAgent,
-            "Referer: https://www.jd.com/",
+            "Referer: https://item.m.jd.com/",
             "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         };
         HttpResult page = HttpClient::get(itemUrl, pageHeaders, config_.jd.cookie,

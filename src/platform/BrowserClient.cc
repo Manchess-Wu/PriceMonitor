@@ -348,7 +348,8 @@ void cleanupStaleProfileLock(const std::string& profileDir) {
 }
 
 pid_t spawnBrowser(const BrowserClient::Options& options, const std::string& url,
-                   int port, bool headless, std::string& err) {
+                   int port, bool headless, std::string& err,
+                   bool loadImages = false) {
     std::vector<std::string> args{options.chromePath};
     cleanupStaleProfileLock(options.profileDir);
     if (headless) {
@@ -361,8 +362,9 @@ pid_t spawnBrowser(const BrowserClient::Options& options, const std::string& url
     args.push_back("--disable-dev-shm-usage");
     args.push_back("--no-first-run");
     args.push_back("--no-default-browser-check");
-    // 采集只需要 DOM 文本：不加载图片/字体，显著缩短详情页加载时间
-    args.push_back("--blink-settings=imagesEnabled=false");
+    // 采集只需要 DOM 文本：不加载图片/字体，显著缩短详情页加载时间。
+    // 登录窗口必须加载图片（二维码/验证码），由调用方显式开启。
+    if (!loadImages) args.push_back("--blink-settings=imagesEnabled=false");
     args.push_back("--disable-background-networking");
     // 多标签并发时，后台标签不被降频，否则第二个 tab 会明显慢于第一个
     args.push_back("--disable-background-timer-throttling");
@@ -660,9 +662,12 @@ bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor
 bool BrowserClient::openForLogin(const Options& options, const std::string& url,
                                  std::string& err) {
     const int port = reservePort();
-    const pid_t pid = spawnBrowser(options, url, port > 0 ? port : 0, false, err);
+    const pid_t pid =
+        spawnBrowser(options, url, port > 0 ? port : 0, false, err, true);
     if (pid < 0) return false;
     logInfo("已启动浏览器，配置目录: " + options.profileDir);
+    logInfo("登录态只会写入上面这个目录；如服务已安装，请确认与服务读取的目录一致"
+            "（推荐用 sudo bash deploy/login.sh 登录）");
     logInfo("请在浏览器窗口中完成登录，登录成功后直接关闭窗口即可");
     const auto started = std::chrono::steady_clock::now();
     int status = 0;

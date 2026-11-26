@@ -537,7 +537,9 @@ BrowserClient::Options BrowserClient::fromConfig(const CrawlerConfig& config) {
 }
 
 bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor,
-                              std::string& html, std::string& err) {
+                              std::string& html, std::string& err,
+                              const std::string& extractExpr,
+                              std::string* extractResult) {
     html.clear();
     int port = 0;
     uint64_t generation = 0;
@@ -605,7 +607,11 @@ bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor
             "l: /login\\.taobao\\.com|havanaone/.test(location.href)}); })()";
         long long lastLength = -1;
         int stableRounds = 0;
-        while (Clock::now() < deadline) {
+        bool markerSeen = false;
+        bool completeSeen = false;
+        auto completeAt = Clock::now();
+        const auto markerDeadline = deadline;
+        while (Clock::now() < markerDeadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             json state;
             if (!cdpCall(ws, nextId++, "Runtime.evaluate",
@@ -616,17 +622,28 @@ bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor
             const std::string value = state["result"].value("value", "");
             json parsed = json::parse(value, nullptr, false);
             if (parsed.is_discarded()) continue;
-            if (parsed.value("p", false) || parsed.value("l", false) ||
-                parsed.value("t", "") == "登录") {
-                break;
-            }
-            // 页面已加载完成且内容长度不再变化时提前结束，避免等满整个超时
+            if (parsed.value("p", false)) markerSeen = true;
+            if (parsed.value("l", false) || parsed.value("t", "") == "登录") break;
+            // 页面已加载完成且内容长度不再变化时提前结束，避免等满整个超时；
+            // 标记出现后还要给页面脚本留出渲染券后价的时间。
             const long long length = parsed.value("n", 0LL);
-            if (parsed.value("r", "") == "complete" && length > 0 && length == lastLength) {
+            const bool complete = parsed.value("r", "") == "complete";
+            if (!completeSeen && complete) {
+                completeSeen = true;
+                completeAt = Clock::now();
+            }
+            const bool settled =
+                markerSeen
+                    ? (completeSeen &&
+                       Clock::now() - completeAt >= std::chrono::milliseconds(1000))
+                    : completeSeen;
+            if (settled && length > 0 && length == lastLength) {
                 if (++stableRounds >= 2) break;
             } else {
                 stableRounds = 0;
             }
+            // 页面一直在变动（广告/倒计时）时不要等满整个超时
+            if (completeSeen && Clock::now() - completeAt >= std::chrono::seconds(5)) break;
             lastLength = length;
         }
         if (!err.empty()) break;
@@ -642,6 +659,30 @@ bool BrowserClient::fetchHtml(const std::string& url, const std::string& waitFor
         html = dump["result"].value("value", "");
         ok = !html.empty();
         if (!ok) err = "浏览器未返回页面内容";
+
+        // 在已渲染的页面上再执行一段取价脚本（券后价这类信息只在可见文本里）。
+        // 券后价有时由页面脚本稍后写入，取不到时短暂重试几次。
+        if (!extractExpr.empty() && extractResult != nullptr) {
+            extractResult->clear();
+            for (int attempt = 0; attempt < 3 && extractResult->empty(); ++attempt) {
+                if (attempt > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+                std::string evalErr;
+                json valueResult;
+                if (cdpCall(ws, nextId++, "Runtime.evaluate",
+                            {{"expression", extractExpr}, {"returnByValue", true}},
+                            sessionId, valueResult, evalErr)) {
+                    if (valueResult.contains("exceptionDetails")) {
+                        logWarn("页面取价脚本异常: " +
+                                valueResult["exceptionDetails"].value("text", ""));
+                    }
+                    *extractResult = valueResult["result"].value("value", "");
+                } else if (attempt == 2) {
+                    logWarn("页面取价脚本执行失败: " + evalErr);
+                }
+            }
+        }
 
         // 共享浏览器不随单次采集关闭，必须主动关掉本任务的标签页
         if (!targetId.empty()) {
@@ -683,6 +724,144 @@ bool BrowserClient::openForLogin(const Options& options, const std::string& url,
         return false;
     }
     return true;
+}
+
+const char* BrowserClient::couponPriceScript() {
+    // 只读取页面可见文本里的券后价，不点击任何“领券”按钮，避免账号副作用和风控。
+    // 天猫/淘宝新版详情页大量内容在 shadow DOM 里，需要递归进入 shadow root 取文本；
+    // 取不到价格时返回 # 开头的上下文片段，便于定位页面的真实文案。
+    return R"JS((() => {
+  const roots = [];
+  (function walk(root) {
+    let list;
+    try { list = root.querySelectorAll('*'); } catch (e) { return; }
+    for (let i = 0; i < list.length; i++) {
+      const el = list[i];
+      if (el.shadowRoot) {
+        roots.push(el.shadowRoot);
+        walk(el.shadowRoot);
+      }
+    }
+  })(document);
+
+  // 天猫详情内容有时在页面内的 iframe 里，跨域会抛异常，忽略即可
+  const frames = [];
+  try {
+    const fs = document.querySelectorAll('iframe');
+    for (let i = 0; i < fs.length; i++) {
+      try {
+        const d = fs[i].contentDocument;
+        if (d && d.body) frames.push(d);
+      } catch (e) {}
+    }
+  } catch (e) {}
+
+  let text = document.body ? (document.body.innerText || "") : "";
+  for (let i = 0; i < roots.length; i++) {
+    const t = roots[i].textContent || "";
+    if (t) text += " " + t.slice(0, 30000);
+  }
+  for (let i = 0; i < frames.length; i++) {
+    const t = frames[i].body.innerText || "";
+    if (t) text += " " + t.slice(0, 30000);
+  }
+  text = text.replace(/\s+/g, " ");
+
+  const kw = "(?:预估到手价|预计到手价|预估券后价|券后价|券后|领券后价|领券后|用券后|到手价|满减后价|满减后|折后价|优惠后)";
+  const re = new RegExp(kw + "\\s*[:：]?\\s*[¥￥]?\\s*([0-9][0-9,]*(?:\\.[0-9]{1,2})?)", "g");
+  const reRev = new RegExp("[¥￥]\\s*([0-9][0-9,]*(?:\\.[0-9]{1,2})?)\\s*" + kw, "g");
+  const out = [];
+  let m;
+  while ((m = re.exec(text)) && out.length < 8) {
+    if (/省|立减|优惠|满[0-9]/.test(m[0])) continue;
+    out.push(m[1]);
+  }
+  if (out.length === 0) {
+    while ((m = reRev.exec(text)) && out.length < 8) out.push(m[1]);
+  }
+  if (out.length === 0) {
+    const ctx = /券|到手|折后|优惠|满减/g;
+    let d;
+    let n = 0;
+    while ((d = ctx.exec(text)) && n < 3) {
+      out.push('#' + text.slice(Math.max(0, d.index - 30), d.index + 50).replace(/\|/g, '/'));
+      n++;
+    }
+    // 价格/优惠相关的 DOM 节点（含 shadow DOM），直接看页面结构
+    const seen = {};
+    let k = 0;
+    const scan = (root) => {
+      let nodes = [];
+      try {
+        nodes = root.querySelectorAll(
+          '[class*="price"],[class*="Price"],[id*="price"],[id*="Price"],' +
+          '[class*="coupon"],[class*="Coupon"],[class*="promo"],[class*="Promo"],' +
+          '[class*="activity"],[class*="Activity"]');
+      } catch (e) {}
+      for (let i = 0; i < nodes.length && k < 10; i++) {
+        const el = nodes[i];
+        const t = (el.innerText || el.textContent || "").toString()
+          .replace(/\s+/g, " ").trim();
+        if (!t || t.length > 120 || seen[t]) continue;
+        seen[t] = 1;
+        out.push('#' + el.tagName + '.' + String(el.className || "").slice(0, 30) +
+                 ' => ' + t.replace(/\|/g, '/'));
+        k++;
+      }
+    };
+    scan(document);
+    for (let i = 0; i < roots.length && k < 10; i++) scan(roots[i]);
+    for (let i = 0; i < frames.length && k < 10; i++) scan(frames[i]);
+  }
+  if (out.length === 0) {
+    out.push('#meta => url=' + location.href + ' title=' + document.title +
+             ' textLen=' + text.length + ' shadow=' + roots.length +
+             ' frames=' + frames.length +
+             ' bodyLen=' + (document.body ? document.body.innerHTML.length : 0) +
+             ' text0=' + text.slice(0, 300).replace(/\|/g, '/'));
+  }
+  return out.join("|");
+})())JS";
+}
+
+std::string BrowserClient::couponDiagnostics(const std::string& candidates) {
+    std::string result;
+    size_t start = 0;
+    while (start < candidates.size()) {
+        const size_t end = candidates.find('|', start);
+        const std::string item = candidates.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (!item.empty() && item[0] == '#') {
+            if (!result.empty()) result += " || ";
+            result += item.substr(1);
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return result;
+}
+
+std::optional<double> BrowserClient::firstCouponPrice(const std::string& candidates) {
+    size_t start = 0;
+    while (start < candidates.size()) {
+        const size_t end = candidates.find('|', start);
+        std::string item = candidates.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        std::string cleaned;
+        cleaned.reserve(item.size());
+        for (char ch : item) {
+            if (ch == '#') return std::nullopt;  // 诊断片段不是价格
+            if (ch != ',') cleaned.push_back(ch);
+        }
+        try {
+            const double value = std::stod(cleaned);
+            if (value > 0) return value;
+        } catch (const std::exception&) {
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return std::nullopt;
 }
 
 }  // namespace pm

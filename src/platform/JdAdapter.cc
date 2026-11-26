@@ -1,7 +1,10 @@
 #include "platform/JdAdapter.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <initializer_list>
+#include <regex>
 
 #include "core/HtmlParser.h"
 #include "core/HttpClient.h"
@@ -55,8 +58,27 @@ double parsePriceText(const std::string& text) {
     }
 }
 
+// 去掉划线价（<del>/<s>/原价、已售罄价等），否则容易把原价当成当前价。
+std::string stripStrikethrough(const std::string& html) {
+    std::string out = html;
+    static const char* patterns[] = {
+        R"re(<del\b[^>]*>[\s\S]*?</del>)re",
+        R"re(<s\b[^>]*>[\s\S]*?</s>)re",
+        R"re(<strike\b[^>]*>[\s\S]*?</strike>)re",
+        R"re(<[^>]+class="[^"]*(?:origin|old-?price|line-through|strike|del-price)[^"]*"[^>]*>[\s\S]*?</[^>]+>)re",
+    };
+    for (const char* pattern : patterns) {
+        try {
+            out = std::regex_replace(out, std::regex(pattern), " ");
+        } catch (const std::exception&) {
+        }
+    }
+    return out;
+}
+
 // 从详情页 HTML 中提取价格（浏览器渲染后的页面兜底）。
-std::optional<double> priceFromPage(const std::string& html) {
+std::optional<double> priceFromPage(const std::string& rawHtml) {
+    const std::string html = stripStrikethrough(rawHtml);
     static const char* patterns[] = {
         // 新版页面：<div class="product-price--value">¥2,498.00</div>
         R"re(class="product-price--value"[^>]*>\s*[￥¥]?\s*(?:<[^>]*>\s*)*[￥¥]?\s*([0-9][0-9,]*(?:\.[0-9]+)?))re",
@@ -96,6 +118,7 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
         "https://item.m.jd.com/product/" + productId + ".html";
     std::string pageHtml;
     std::string pageError;
+    std::string couponText;  // 页面上的券后价/到手价候选
 
     // 1) 直接用浏览器加载详情页。p.3.cn 价格接口在部分网络下长期超时
     //    （每次白等 timeout），已移除，改为浏览器优先。
@@ -103,7 +126,8 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
         BrowserClient browser(BrowserClient::fromConfig(config_));
         std::string html;
         std::string browserError;
-        if (browser.fetchHtml(itemUrl, "priceSale2", html, browserError)) {
+        if (browser.fetchHtml(itemUrl, "priceSale2", html, browserError,
+                              BrowserClient::couponPriceScript(), &couponText)) {
             pageHtml = std::move(html);
             logInfo("京东页面采集完成: " + std::to_string(pageHtml.size()) +
                     " 字节，登录提示=" +
@@ -114,8 +138,23 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
             }
             std::string maskedRaw;
             const bool maskedPrice = hasMaskedPrice(pageHtml, &maskedRaw);
-            if (auto price = priceFromPage(pageHtml)) {
-                result.price = *price;
+
+            // 券后价/到手价优先，页面上已经展示则直接读取
+            auto pagePrice = priceFromPage(pageHtml);
+            auto couponPrice = BrowserClient::firstCouponPrice(couponText);
+            if (couponPrice && pagePrice &&
+                (*couponPrice > *pagePrice || *couponPrice < *pagePrice * 0.3)) {
+                couponPrice.reset();  // 防止误取推荐商品的券后价
+            }
+            if (couponPrice) {
+                logInfo("京东使用券后价: " + fmtPrice(*couponPrice) +
+                        (pagePrice ? "（页面价 " + fmtPrice(*pagePrice) + "）" : ""));
+                result.price = *couponPrice;
+                result.ok = true;
+                result.inStock = !contains(pageHtml, "无货");
+                result.raw = "{\"source\":\"browser-coupon\"}";
+            } else if (pagePrice) {
+                result.price = *pagePrice;
                 result.ok = true;
                 result.inStock = !contains(pageHtml, "无货");
                 result.raw = "{\"source\":\"browser\"}";
@@ -137,6 +176,55 @@ FetchResult JdAdapter::fetch(const std::string& productId, bool withMeta) {
                             "），需要登录后查看：请执行 ./PriceMonitor --login jd 后重试";
             } else {
                 pageError = "页面中未找到价格";
+            }
+            if (!couponPrice) {
+                const std::string diag =
+                    BrowserClient::couponDiagnostics(couponText);
+                if (!diag.empty()) {
+                    logWarn("京东未找到券后价，页面片段: " + truncate(diag, 600));
+                }
+                // 打出一小段价格区 HTML，便于核对是否取到了划线价
+                auto compact = [](const std::string& s) {
+                    std::string out;
+                    bool space = false;
+                    for (char ch : s) {
+                        const bool sp =
+                            std::isspace(static_cast<unsigned char>(ch)) != 0;
+                        if (sp) {
+                            if (!space) out.push_back(' ');
+                            space = true;
+                        } else {
+                            out.push_back(ch);
+                            space = false;
+                        }
+                    }
+                    return out;
+                };
+                if (auto jdPrice = regexGroup(
+                        pageHtml, R"re("jdPrice"\s*:\s*"([^"]*)")re")) {
+                    logInfo("京东jdPrice: " + truncate(*jdPrice, 80));
+                }
+                size_t pos = pageHtml.find("summary-price");
+                if (pos == std::string::npos) pos = pageHtml.find("product-price");
+                if (pos == std::string::npos) pos = pageHtml.find("p-price");
+                if (pos != std::string::npos) {
+                    const size_t begin = pos > 120 ? pos - 120 : 0;
+                    logInfo("京东价格区: " + compact(pageHtml.substr(begin, 900)));
+                }
+                try {
+                    const std::regex priceClass(R"re(class="[^"]*[Pp]rice[^"]*")re");
+                    std::sregex_iterator it(pageHtml.begin(), pageHtml.end(),
+                                            priceClass);
+                    const std::sregex_iterator end;
+                    int n = 0;
+                    for (; it != end && n < 4; ++it, ++n) {
+                        logInfo("京东价格节点: " +
+                                compact(pageHtml.substr(
+                                    it->position(),
+                                    std::min<size_t>(260, pageHtml.size() - it->position()))));
+                    }
+                } catch (const std::exception&) {
+                }
             }
         } else {
             pageError = "浏览器采集京东失败: " + browserError;

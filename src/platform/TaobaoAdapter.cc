@@ -88,12 +88,14 @@ FetchResult TaobaoAdapter::fetch(const std::string& productId, bool withMeta) {
 
     // 淘宝商品页需要执行页面 JS 才能通过风控，优先用本机浏览器加载。
     std::string body;
+    std::string couponText;  // 页面上的券后价/到手价候选
     bool viaBrowser = false;
     if (config_.browser.enabled) {
         BrowserClient browser(BrowserClient::fromConfig(config_));
         std::string html;
         std::string browserError;
-        if (browser.fetchHtml(url, "priceText", html, browserError)) {
+        if (browser.fetchHtml(url, "priceText", html, browserError,
+                              BrowserClient::couponPriceScript(), &couponText)) {
             body = std::move(html);
             viaBrowser = true;
         } else {
@@ -158,6 +160,14 @@ FetchResult TaobaoAdapter::fetch(const std::string& productId, bool withMeta) {
         return result;
     }
 
+    if (contains(body, "访问异常") || contains(body, "访问过于频繁") ||
+        contains(body, "请稍后再试")) {
+        result.error =
+            "天猫/淘宝返回访问异常页（风控），请重新登录或降低采集频率后重试";
+        result.loginRequired = true;
+        return result;
+    }
+
     // 1. 价格：优先使用 DOM 节点，其次使用页面内嵌 JSON
     std::optional<double> price;
     std::string priceSource;
@@ -195,6 +205,33 @@ FetchResult TaobaoAdapter::fetch(const std::string& productId, bool withMeta) {
                     break;
                 }
             }
+        }
+    }
+
+    if (price) {
+        logInfo(std::string(tmall_ ? "天猫" : "淘宝") + "页面价: " + fmtPrice(*price) +
+                "（来源: " + truncate(priceSource, 40) + "）");
+    }
+
+    // 券后价/到手价优先：页面通常已直接展示，读取即可，不需要点“领券”。
+    if (auto coupon = BrowserClient::firstCouponPrice(couponText)) {
+        // 避免把推荐商品的券后价误当成主商品：明显低于页面价 30% 的丢弃
+        if (price && (*coupon > *price || *coupon < *price * 0.3)) {
+            coupon.reset();
+        } else {
+            logInfo(std::string(tmall_ ? "天猫" : "淘宝") + "使用券后价: " +
+                    fmtPrice(*coupon) +
+                    (price ? "（页面价 " + fmtPrice(*price) + "）" : ""));
+            price = coupon;
+            priceSource = "券后价";
+        }
+    }
+
+    if (!couponText.empty() &&
+        !BrowserClient::firstCouponPrice(couponText)) {
+        const std::string diag = BrowserClient::couponDiagnostics(couponText);
+        if (!diag.empty()) {
+            logWarn("未找到券后价，页面片段: " + truncate(diag, 600));
         }
     }
 
